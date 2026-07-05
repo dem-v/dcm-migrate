@@ -263,7 +263,7 @@ class RoutingCfg:
 class NetworkCfg:
     max_associations: int = 3
     rate_limit_mbit: float = 350.0        # 0 = unlimited
-    active_hours: str = "" # "20:00-07:00"     # "" = always
+    active_hours: str = "20:00-07:00"     # "" = always
     active_days: list[str] = field(default_factory=lambda: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"])
     instances_per_association: int = 500
     backoff_initial_s: float = 5.0
@@ -298,7 +298,7 @@ class SourceCfg:
     roots: list[str] = field(default_factory=list)
     calling_aet: str = "MIGRATE"
     priority: int = 100                    # lower wins duplicate resolution
-    charset_policy: str = "keep-gb"           # utf8 | keep-gb | keep
+    charset_policy: str = "utf8"           # utf8 | keep-gb | keep
     charset_source: str = "auto"           # "auto" or a python codec name (cp1251, gb18030, ...)
     charset_detect_order: list[str] = field(default_factory=lambda: ["utf-8", "cp1251", "latin-1"])
     caret_repair: bool = False
@@ -498,22 +498,22 @@ network_timeout = 60
 # The new PACS is split per modality: same IP, different port + called AET.
 # Ask the PACS admin for the real values; `dcm_migrate.py echo` validates all.
 [server.destinations.ct]
-port = 11113
-called_aet = "CTPACS"
-[server.destinations.xray]
 port = 11112
-called_aet = "XRAYPACS"
+called_aet = "REPLACE_CT_AET"
+[server.destinations.xray]
+port = 11113
+called_aet = "REPLACE_XRAY_AET"
 [server.destinations.xa]
 port = 11114
-called_aet = "ANGIOPACS"
+called_aet = "REPLACE_XA_AET"
 [server.destinations.other]
 port = 11115
-called_aet = "USPACS"
+called_aet = "REPLACE_OTHER_AET"
 
 [routing]
 # Modality values -> destination group.  A study is routed as a whole:
 # highest-precedence group among its member modalities wins.
-ct   = ["CT", "MR"]
+ct   = ["CT"]
 xray = ["CR", "DX"]
 xa   = ["XA", "RF"]
 precedence = ["ct", "xa", "xray", "other"]
@@ -521,7 +521,7 @@ precedence = ["ct", "xa", "xray", "other"]
 [network]
 max_associations = 3            # concurrent associations (sender threads)
 rate_limit_mbit = 350           # bandwidth cap; 0 = unlimited (link is shared!)
-active_hours = "" # "20:00-07:00"    # local time window; "" = around the clock
+active_hours = "20:00-07:00"    # local time window; "" = around the clock
 active_days = ["mon","tue","wed","thu","fri","sat","sun"]
 instances_per_association = 500 # recycle the association after N stores
 backoff_initial_s = 5
@@ -552,7 +552,7 @@ exclude_file_globs = ["index*", "*.db", "*.log", "*.txt"]
 [[source]]
 name = "orthanc_blob"
 adapter = "orthanc"
-roots = ['REPLACE_ME']
+roots = ['REPLACE_ME:\OrthancStorage']
 index_db = ""                    # optional: path to Orthanc's SQLite 'index' file
 calling_aet = "MIG_ORTHANC"
 priority = 20
@@ -563,7 +563,7 @@ max_readers = 4
 [[source]]
 name = "vxvue"
 adapter = "filetree"
-roots = ['REPLACE_ME']
+roots = ['REPLACE_ME:\archive\vxvue']
 calling_aet = "MIG_VXVUE"
 priority = 30
 charset_policy = "utf8"
@@ -580,7 +580,7 @@ pid_rules_mode = "optional"      # IDs are close-to-correct; rules normalize the
 [[source]]
 name = "perlove"
 adapter = "filetree"
-roots = ['REPLACE_ME']
+roots = ['REPLACE_ME:\archive\perlove']
 calling_aet = "MIG_PERLOVE"
 priority = 40
 charset_policy = "keep-gb"       # newer Perlove records arrive in GB -> keep GB,
@@ -592,7 +592,7 @@ max_readers = 4
 [[source]]
 name = "fuji_cr"
 adapter = "filetree"
-roots = ['REPLACE_ME']
+roots = ['REPLACE_ME:\archive\fuji']
 calling_aet = "MIG_FUJI"
 priority = 50
 charset_policy = "utf8"
@@ -684,7 +684,7 @@ def sha256_file(path: str, bufsize: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-_UID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/dem-v/dcm-migrate")
+_UID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/dcm-migrate")
 
 
 def make_uid(uid_root: str, *parts: str) -> str:
@@ -816,6 +816,7 @@ CREATE TABLE IF NOT EXISTS files(
   kind INTEGER NOT NULL DEFAULT 0,
   scan_status INTEGER NOT NULL DEFAULT 0,
   error TEXT,
+  content_hash TEXT,
   UNIQUE(root_id, rel_path));
 CREATE TABLE IF NOT EXISTS patients(
   patient_pk INTEGER PRIMARY KEY,
@@ -929,6 +930,12 @@ def db_init(path: str) -> None:
     with conn:
         conn.executescript(SCHEMA)
         conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','1')")
+    # additive upgrades for databases created by older versions
+    try:
+        with conn:
+            conn.execute("ALTER TABLE files ADD COLUMN content_hash TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already present
     conn.close()
 
 
@@ -1078,6 +1085,10 @@ def add_problem(w: DbWriter, run_id: int, severity: int, code: str, scope: str,
 _PLAUSIBLE_GROUPS = {0x0002, 0x0008, 0x0010, 0x0018, 0x0020, 0x0028, 0x0032, 0x0040, 0x7FE0}
 
 
+class NotDicomPayload(ValueError):
+    """A container/wrapper opened fine but its payload is not a DICOM dataset."""
+
+
 def sniff_kind(head: bytes, size: int) -> int:
     """Classify a file from its first bytes.  Never raises."""
     if size < 8 or len(head) < 8:
@@ -1111,12 +1122,23 @@ class ReadResult:
         self.orig_little = orig_little
 
 
-def read_dicom(path: str, kind: int, *, headers_only: bool) -> ReadResult:
-    """Read a DICOM file of any supported kind.  Raises on parse failure."""
+def read_dicom(path: str, kind: int, *, headers_only: bool,
+               fp: io.IOBase | None = None) -> ReadResult:
+    """Read a DICOM file of any supported kind.  Raises on parse failure.
+
+    `fp`: an already-open binary handle to reuse (the scanner sniffs and parses
+    from ONE open — on HDDs the second open/seek per file is real money).
+    Caller keeps ownership of a passed-in fp.  Header-only reads use a modest
+    buffer: a 1 MB buffer would drag the whole file off disk for typical CT
+    slices when we only need the few-KB header."""
     apath = winpath(path)
     if kind in (K_ZLIB_PART10, K_ZLIB_PREAMBLELESS):
-        with open(apath, "rb") as f:
-            blob = f.read()
+        if fp is not None:
+            fp.seek(0)
+            blob = fp.read()
+        else:
+            with open(apath, "rb") as f:
+                blob = f.read()
         usize = int.from_bytes(blob[0:8], "little")
         data = zlib.decompress(blob[8:])
         if len(data) != usize:
@@ -1127,11 +1149,18 @@ def read_dicom(path: str, kind: int, *, headers_only: bool) -> ReadResult:
         elif inner == K_PREAMBLELESS:
             kind = K_ZLIB_PREAMBLELESS
         else:
-            raise ValueError(f"zlib payload is not DICOM ({KIND_NAMES.get(inner)})")
-        fp: io.IOBase = io.BytesIO(data)
+            # e.g. Orthanc's compressed DICOM-as-JSON summaries: metadata, not damage
+            raise NotDicomPayload(f"zlib payload is not DICOM ({KIND_NAMES.get(inner)})")
+        fp = io.BytesIO(data)
+        close_after = False
         payload_size = len(data)
+    elif fp is not None:
+        fp.seek(0)
+        close_after = False
+        payload_size = os.fstat(fp.fileno()).st_size
     else:
-        fp = open(apath, "rb", buffering=1 << 20)
+        fp = open(apath, "rb", buffering=(1 << 18) if headers_only else (1 << 20))
+        close_after = True
         payload_size = os.fstat(fp.fileno()).st_size
 
     try:
@@ -1141,7 +1170,7 @@ def read_dicom(path: str, kind: int, *, headers_only: bool) -> ReadResult:
                      defer_size=4096 if headers_only else None)
         header_end = fp.tell()
     finally:
-        if not isinstance(fp, io.BytesIO):
+        if close_after:
             fp.close()
 
     if force and len(ds) == 0:
@@ -1286,7 +1315,10 @@ def extract_header(rr: ReadResult, src: SourceCfg, file_size: int) -> dict:
         institution=(raw_bytes_of(ds, Tag(0x0008, 0x0080)) or b"").decode("latin-1", "replace").strip(),
         station=safe_str(ds, "StationName", 32),
         charset=charset, facts=facts,
-        is_decimal_tags=",".join(dec_tags), text_sample=sample,
+        is_decimal_tags=",".join(dec_tags),
+        # the sample only feeds charset detection — pure-ASCII files (most CT)
+        # don't need one, and at tens of millions of rows it dominates DB size
+        text_sample=sample if facts & F_NONASCII_TEXT else None,
     )
     return rec
 
@@ -1476,8 +1508,8 @@ _TRANSLIT_MULTI = {
     "ё": "yo", "Ё": "Yo", "є": "ie", "Є": "Ie", "ї": "ii", "Ї": "Ii",
 }
 _TRANSLIT_SINGLE = dict(zip(
-    "абвгґдезиыйіклмнопрстуфхцэАБВГҐДЕЗИЫЙІКЛМНОПРСТУФХЦЭьъЬЪ",
-    "abvggdezyyjiklmnoprstufhceABVGGDEZYYJIKLMNOPRSTUFHCE''''"))
+    "абвгґдезиыйіклмнопрстуфхцэАБВГҐДЕЗИЫЙІКЛМНОПРСТУФХЦЭ",
+    "abvggdezyyjiklmnoprstufhceABVGGDEZYYJIKLMNOPRSTUFHCE"))
 _TRANSLIT_DROP = set("ъьЪЬ`'’")
 
 
@@ -1814,24 +1846,34 @@ def src_from_dict(d: dict) -> SourceCfg:
 
 
 def _scan_one(src: SourceCfg, abs_path: str, base: dict) -> dict:
-    """Classify + header-read one file.  Returns a result dict; never raises."""
+    """Classify + header-read one file.  Returns a result dict; never raises.
+    One open() per file: sniff and parse share the handle (HDD seeks are the
+    scan's dominant cost)."""
     try:
-        with open(winpath(abs_path), "rb") as f:
-            head = f.read(512)
+        f = open(winpath(abs_path), "rb", buffering=1 << 18)
     except OSError as e:
         return {**base, "status": "error", "kind": K_UNKNOWN, "error": f"open: {e}"}
-    kind = sniff_kind(head, base["size"])
-    if kind in (K_ORTHANC_JSON, K_NONDICOM):
-        return {**base, "status": "nondicom", "kind": kind}
-    if kind == K_TRUNCATED:
-        return {**base, "status": "error", "kind": kind, "error": "zero-length or truncated"}
     try:
-        rr = read_dicom(abs_path, kind, headers_only=True)
-        rec = extract_header(rr, src, base["size"])
-    except Exception as e:
-        err = str(e)[:300]
-        k = K_TRUNCATED if isinstance(e, EOFError) or "unexpected end" in err.lower() else kind
-        return {**base, "status": "error", "kind": k, "error": f"parse: {err}"}
+        try:
+            head = f.read(512)
+        except OSError as e:
+            return {**base, "status": "error", "kind": K_UNKNOWN, "error": f"read: {e}"}
+        kind = sniff_kind(head, base["size"])
+        if kind in (K_ORTHANC_JSON, K_NONDICOM):
+            return {**base, "status": "nondicom", "kind": kind}
+        if kind == K_TRUNCATED:
+            return {**base, "status": "error", "kind": kind, "error": "zero-length or truncated"}
+        try:
+            rr = read_dicom(abs_path, kind, headers_only=True, fp=f)
+            rec = extract_header(rr, src, base["size"])
+        except NotDicomPayload:
+            return {**base, "status": "nondicom", "kind": K_NONDICOM}
+        except Exception as e:
+            err = str(e)[:300]
+            k = K_TRUNCATED if isinstance(e, EOFError) or "unexpected end" in err.lower() else kind
+            return {**base, "status": "error", "kind": k, "error": f"parse: {err}"}
+    finally:
+        f.close()
     if not rec["sop_uid"]:
         # a real DICM marker means it IS DICOM — an empty/UID-less parse is damage,
         # not a decoy, and must surface as a hard problem rather than silently drop
@@ -1883,7 +1925,7 @@ class ScanIngestor:
             "VALUES(?,?,?,?,?,?,?) "
             "ON CONFLICT(root_id, rel_path) DO UPDATE SET size=excluded.size, "
             "mtime_ns=excluded.mtime_ns, kind=excluded.kind, scan_status=excluded.scan_status, "
-            "error=excluded.error RETURNING file_id",
+            "error=excluded.error, content_hash=NULL RETURNING file_id",
             (rid, item["rel"], item["size"], item["mtime_ns"], item["kind"], scan_status, error),
         ).fetchone()
         return row[0]
@@ -1900,11 +1942,14 @@ class ScanIngestor:
         self.patient_cache[key] = v
         return v
 
+    _FILL_FIELDS = ("study_date", "study_time", "accession", "institution", "station")
+
     def _study_pk(self, conn, source: str, rec: dict, patient_pk: int) -> int:
         uid = rec["study_uid"] or f"?missing?{source}?{rec['pid']}?{rec['study_date']}?{rec['accession']}"
         cached = self.study_cache.get(uid)
         if cached is None:
-            row = conn.execute("SELECT study_pk, modalities FROM studies WHERE study_uid=?",
+            row = conn.execute("SELECT study_pk, modalities, study_date, study_time,"
+                               " accession, institution, station FROM studies WHERE study_uid=?",
                                (uid,)).fetchone()
             if row is None:
                 cur = conn.execute(
@@ -1916,29 +1961,33 @@ class ScanIngestor:
                      rec["modality"]))
                 pk = cur.lastrowid
                 mods = {rec["modality"]} if rec["modality"] else set()
-                self.study_cache[uid] = (pk, mods)
+                self.study_cache[uid] = (pk, mods, {f for f in self._FILL_FIELDS if not rec[f]})
                 return pk
             pk = row["study_pk"]
             mods = set(filter(None, row["modalities"].split(",")))
-            cached = (pk, mods)
+            cached = (pk, mods, {f for f in self._FILL_FIELDS if not row[f]})
             self.study_cache[uid] = cached
-        pk, mods = cached
+        pk, mods, missing = cached
         if rec["modality"] and rec["modality"] not in mods:
             mods.add(rec["modality"])
             conn.execute("UPDATE studies SET modalities=? WHERE study_pk=?",
                          (",".join(sorted(mods)), pk))
-        # fill still-empty descriptive fields from later instances
-        conn.execute(
-            "UPDATE studies SET "
-            " study_date=CASE WHEN study_date='' THEN ? ELSE study_date END,"
-            " study_time=CASE WHEN study_time='' THEN ? ELSE study_time END,"
-            " accession=CASE WHEN accession='' THEN ? ELSE accession END,"
-            " institution=CASE WHEN institution='' THEN ? ELSE institution END,"
-            " station=CASE WHEN station='' THEN ? ELSE station END "
-            "WHERE study_pk=? AND (study_date='' OR study_time='' OR accession=''"
-            " OR institution='' OR station='')",
-            (rec["study_date"], rec["study_time"], rec["accession"], rec["institution"],
-             rec["station"], pk))
+        # fill still-empty descriptive fields from later instances — but only when
+        # this instance actually brings something new (a CT study with a forever-
+        # empty StationName must not cost one UPDATE per slice)
+        fill = {f for f in missing if rec[f]}
+        if fill:
+            conn.execute(
+                "UPDATE studies SET "
+                " study_date=CASE WHEN study_date='' THEN ? ELSE study_date END,"
+                " study_time=CASE WHEN study_time='' THEN ? ELSE study_time END,"
+                " accession=CASE WHEN accession='' THEN ? ELSE accession END,"
+                " institution=CASE WHEN institution='' THEN ? ELSE institution END,"
+                " station=CASE WHEN station='' THEN ? ELSE station END "
+                "WHERE study_pk=?",
+                (rec["study_date"], rec["study_time"], rec["accession"], rec["institution"],
+                 rec["station"], pk))
+            missing -= fill
         return pk
 
     def ingest_batch(self, conn, items: list[dict]) -> None:
@@ -2058,7 +2107,10 @@ class SourceScanJob(threading.Thread):
                 if prev is not None and self.rescan != "full":
                     psize, pmt, pstatus = prev
                     unchanged = (psize == size and pmt == mtime_ns)
-                    if unchanged and not (self.rescan == "errors" and pstatus == FS_ERROR):
+                    retry = ((self.rescan == "errors" and pstatus == FS_ERROR)
+                             or (self.rescan == "reclassify"
+                                 and pstatus in (FS_ERROR, FS_NONDICOM)))
+                    if unchanged and not retry:
                         self.stats["skipped"] += 1
                         continue
                 base = {"source": src.name, "root": root, "rel": rel,
@@ -2282,7 +2334,7 @@ def _an_dedupe(conn, cfg: Config, run: int) -> None:
     n_dedup, n_conflict, n_pixelless_dropped = 0, 0, 0
     for g, sop_uid in enumerate(dup_uids, start=1):
         rows = conn.execute(
-            "SELECT i.instance_id, i.source, i.facts, f.file_id, f.size "
+            "SELECT i.instance_id, i.source, i.facts, f.file_id, f.size, f.content_hash "
             "FROM instances i JOIN files f USING(file_id) "
             "WHERE i.sop_uid=? AND i.send_status!=?", (sop_uid, S_EXCLUDED)).fetchall()
         with_pixels = [r for r in rows if not r["facts"] & F_NO_PIXELS]
@@ -2302,10 +2354,15 @@ def _an_dedupe(conn, cfg: Config, run: int) -> None:
         if len(sizes) == 1:
             hashes = set()
             for r in contenders:
-                try:
-                    hashes.add(sha256_file(_abs_path(conn, r["file_id"])))
-                except OSError as e:
-                    hashes.add(f"unreadable:{r['file_id']}:{e}")
+                h = r["content_hash"]  # cached across analyze runs (reset when file changes)
+                if not h:
+                    try:
+                        h = sha256_file(_abs_path(conn, r["file_id"]))
+                        conn.execute("UPDATE files SET content_hash=? WHERE file_id=?",
+                                     (h, r["file_id"]))
+                    except OSError as e:
+                        h = f"unreadable:{r['file_id']}:{e}"
+                hashes.add(h)
             same = len(hashes) == 1
         contenders.sort(key=lambda r: (prio.get(r["source"], 999), r["instance_id"]))
         if same:
@@ -3647,6 +3704,177 @@ def cmd_export_mapping(cfg: Config, args) -> int:
     conn.close()
     return 0
 
+def _probe_file(path: str) -> list[str]:
+    """Forensic look at one file: magic bytes, structure guesses, parse attempts."""
+    lines = []
+    try:
+        with open(winpath(path), "rb") as f:
+            head = f.read(4096)
+            f.seek(0, 2)
+            size = f.tell()
+    except OSError as e:
+        return [f"  OPEN FAILED: {e}"]
+    printable = sum(1 for b in head if 32 <= b < 127 or b in (9, 10, 13))
+    lines.append(f"  size={size:,}  head16={head[:16].hex(' ')}")
+    lines.append(f"  printable={100 * printable // max(1, len(head))}%  "
+                 f"distinct_bytes={len(set(head))}  sniff={KIND_NAMES.get(sniff_kind(head, size))}")
+    if len(head) >= 132 and head[128:132] == b"DICM":
+        lines.append("  DICM marker at offset 128: YES")
+    if head[:2] == b"\x1f\x8b":
+        lines.append("  gzip magic at 0")
+    stripped = head.lstrip()
+    if stripped[:1] in (b"{", b"["):
+        lines.append(f"  JSON-ish, starts: {stripped[:70]!r}")
+    # "N;<md5hex>[;]" ASCII prefix (seen in the wild on Orthanc-layout storages):
+    # try every plausible payload interpretation after the prefix
+    m = re.match(rb"^(\d+);([0-9a-fA-F]{32})(;?)", head)
+    if m:
+        off = m.end()
+        lines.append(f"  prefixed format: version={m.group(1).decode()} "
+                     f"md5={m.group(2).decode()} payload@{off}")
+        try:
+            with open(winpath(path), "rb") as f:
+                blob = f.read(64 << 20)
+            payload = blob[off:]
+            lines.append(f"    payload_head16={payload[:16].hex(' ')}  payload_len={len(payload):,}")
+            inner_direct = sniff_kind(payload[:512], len(payload))
+            if inner_direct != K_NONDICOM:
+                lines.append(f"    payload as-is sniffs as: {KIND_NAMES.get(inner_direct)}")
+            import hashlib as _h
+            for what, data_ in (("payload", payload), ("whole-file", blob)):
+                if _h.md5(data_).hexdigest().lower() == m.group(2).decode().lower():
+                    lines.append(f"    md5 prefix matches {what}")
+            for wb, wlabel in ((15, "zlib"), (-15, "raw-deflate"), (31, "gzip")):
+                try:
+                    data = zlib.decompress(payload, wb)
+                except zlib.error:
+                    continue
+                inner = sniff_kind(data[:512], len(data))
+                lines.append(f"    {wlabel}: inflates to {len(data):,} bytes, "
+                             f"inner={KIND_NAMES.get(inner)}  inner_head32={data[:32].hex(' ')}")
+                if data[:1] in (b"{", b"["):
+                    lines.append(f"    inflated JSON starts: {data[:90]!r}")
+                if _h.md5(data).hexdigest().lower() == m.group(2).decode().lower():
+                    lines.append("    md5 prefix matches INFLATED payload")
+                break
+            # maybe payload is size-prefixed like Orthanc zlib-with-size
+            if len(payload) > 10 and payload[8] == 0x78:
+                try:
+                    data = zlib.decompress(payload[8:])
+                    usize = int.from_bytes(payload[:8], "little")
+                    inner = sniff_kind(data[:512], len(data))
+                    lines.append(f"    size+zlib@+8: inflates to {len(data):,} "
+                                 f"(prefix says {usize:,}), inner={KIND_NAMES.get(inner)}")
+                except zlib.error:
+                    pass
+        except OSError as e:
+            lines.append(f"    payload read failed: {e}")
+    # zlib stream candidates: bare at offset 0, or Orthanc uint64-size-prefixed at 8
+    for off, label in ((0, "bare-zlib@0"), (8, "orthanc-zlib@8")):
+        if len(head) > off + 2 and head[off] == 0x78 and head[off + 1] in (0x01, 0x5E, 0x9C, 0xDA):
+            if size > (64 << 20):
+                lines.append(f"  {label}: candidate, file too big to inflate in probe")
+                continue
+            try:
+                with open(winpath(path), "rb") as f:
+                    blob = f.read()
+                data = zlib.decompress(blob[off:])
+                inner = sniff_kind(data[:512], len(data))
+                lines.append(f"  {label}: inflates to {len(data):,} bytes, "
+                             f"inner={KIND_NAMES.get(inner)}  inner_head16={data[:16].hex(' ')}")
+                if off == 8:
+                    usize = int.from_bytes(blob[0:8], "little")
+                    lines.append(f"    size-prefix says {usize:,} "
+                                 f"({'matches' if usize == len(data) else 'MISMATCH'})")
+            except zlib.error as e:
+                lines.append(f"  {label}: zlib magic but inflate failed: {e}")
+    try:
+        ds = dcmread(winpath(path), stop_before_pixels=True, force=True, defer_size=1024)
+        if len(ds):
+            lines.append(f"  force-dcmread: {len(ds)} elements, "
+                         f"SOPClass={safe_str(ds, 'SOPClassUID', 64) or '?'} "
+                         f"Modality={safe_str(ds, 'Modality', 8) or '?'} "
+                         f"TS={str(getattr(getattr(ds, 'file_meta', None), 'get', lambda *a: '')('TransferSyntaxUID', '') or '?')}")
+        else:
+            lines.append("  force-dcmread: parses to 0 elements (not DICOM)")
+    except Exception as e:
+        lines.append(f"  force-dcmread: failed ({str(e)[:90]})")
+    return lines
+
+
+def cmd_probe(cfg: Config, args) -> int:
+    if args.path:
+        for p in args.path:
+            print(f"\n== {p}")
+            print("\n".join(_probe_file(p)))
+        return 0
+    if not args.source:
+        raise SystemExit("probe needs --source NAME (or explicit --path files)")
+    conn = db_connect(cfg.general.db_path, readonly=True)
+    statuses = {"nondicom": (FS_NONDICOM,), "errors": (FS_ERROR,),
+                "all": (FS_NONDICOM, FS_ERROR)}[args.status]
+    print(f"source {args.source} — scan status so far:")
+    for st, n in conn.execute(
+            "SELECT f.scan_status, COUNT(*) FROM files f JOIN roots r USING(root_id) "
+            "WHERE r.source=? GROUP BY f.scan_status", (args.source,)):
+        name = {FS_PENDING: "pending", FS_OK: "dicom-ok", FS_ERROR: "error",
+                FS_EXCLUDED: "excluded", FS_NONDICOM: "non-dicom"}.get(st, st)
+        print(f"  {name:<10} {n:,}")
+    print("size distribution (from DB, no file reads):")
+    print(f"  {'status':<10} {'bucket':<10} {'files':>12} {'total':>12}")
+    for st, bucket, n, total in conn.execute(
+            "SELECT f.scan_status, CASE WHEN f.size < 4096 THEN 'a <4KB' "
+            " WHEN f.size < 65536 THEN 'b 4-64KB' WHEN f.size < 1048576 THEN 'c 64KB-1MB' "
+            " WHEN f.size < 10485760 THEN 'd 1-10MB' ELSE 'e >10MB' END AS bucket, "
+            " COUNT(*), SUM(f.size) FROM files f JOIN roots r USING(root_id) "
+            "WHERE r.source=? GROUP BY f.scan_status, bucket ORDER BY f.scan_status, bucket",
+            (args.source,)):
+        name = {FS_OK: "dicom-ok", FS_ERROR: "error", FS_NONDICOM: "non-dicom",
+                FS_EXCLUDED: "excluded", FS_PENDING: "pending"}.get(st, st)
+        print(f"  {name:<10} {bucket[2:]:<10} {n:>12,} {human_bytes(total or 0):>12}")
+    qmarks = ",".join("?" * len(statuses))
+    rows = conn.execute(
+        f"SELECT f.file_id, f.scan_status, f.error, r.path AS root, f.rel_path AS rel "
+        f"FROM files f JOIN roots r USING(root_id) "
+        f"WHERE r.source=? AND f.scan_status IN ({qmarks}) ORDER BY RANDOM() LIMIT ?",
+        (args.source, *statuses, args.sample)).fetchall()
+    sig_hist: dict[str, int] = {}
+    ext_hist: dict[str, int] = {}
+    for row in rows:
+        p = os.path.join(row["root"], row["rel"])
+        status = "error" if row["scan_status"] == FS_ERROR else "non-dicom"
+        print(f"\n== [{status}] {p}")
+        if row["error"]:
+            print(f"  recorded error: {row['error'][:120]}")
+        for line in _probe_file(p):
+            print(line)
+        try:
+            with open(winpath(p), "rb") as f:
+                sig = f.read(4).hex(" ")
+        except OSError:
+            sig = "unreadable"
+        sig_hist[sig] = sig_hist.get(sig, 0) + 1
+        ext = os.path.splitext(row["rel"])[1].lower() or "(none)"
+        ext_hist[ext] = ext_hist.get(ext, 0) + 1
+    if rows:
+        print("\nsampled first-4-bytes histogram:")
+        for sig, n in sorted(sig_hist.items(), key=lambda kv: -kv[1]):
+            print(f"  {sig:<14} {n}")
+        print("sampled extension histogram:")
+        for ext, n in sorted(ext_hist.items(), key=lambda kv: -kv[1]):
+            print(f"  {ext:<10} {n}")
+    errs = conn.execute(
+        "SELECT substr(COALESCE(error,''),1,60) e, COUNT(*) FROM files f JOIN roots r USING(root_id) "
+        "WHERE r.source=? AND f.scan_status=? GROUP BY e ORDER BY COUNT(*) DESC LIMIT 10",
+        (args.source, FS_ERROR)).fetchall()
+    if errs:
+        print("\ntop recorded scan errors:")
+        for e, n in errs:
+            print(f"  {n:>8,}  {e}")
+    conn.close()
+    return 0
+
+
 # --------------------------------------------------------------------------
 # SECTION 16 — SELFTEST (synthetic data, loopback SCP, end-to-end)
 # --------------------------------------------------------------------------
@@ -4239,9 +4467,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("scan", help="inventory sources (header-only reads; incremental)")
     sp.add_argument("--source", nargs="*", help="limit to these source names")
-    sp.add_argument("--rescan", choices=["new", "errors", "full"], default="new",
+    sp.add_argument("--rescan", choices=["new", "errors", "reclassify", "full"], default="new",
                     help="new: skip unchanged files (default); errors: also retry error files; "
-                         "full: re-read everything")
+                         "reclassify: also re-read files previously classified non-DICOM "
+                         "(after a sniffer fix); full: re-read everything")
     sp.add_argument("--limit", type=int, default=0, help="stop each source after N files (pilot)")
     sp.add_argument("--force-threads", action="store_true", help=argparse.SUPPRESS)
 
@@ -4282,6 +4511,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--called-aet", default=None)
     sp.add_argument("--calling-aet", default=None)
 
+    sp = sub.add_parser("probe", help="forensically inspect files classified non-DICOM/error")
+    sp.add_argument("--source", help="sample from this source's recorded non-DICOM/error files")
+    sp.add_argument("--sample", type=int, default=15, help="how many random files to inspect")
+    sp.add_argument("--status", choices=["nondicom", "errors", "all"], default="all")
+    sp.add_argument("--path", nargs="*", help="probe specific file paths instead of sampling")
+
     sub.add_parser("status", help="one-screen progress summary")
     sub.add_parser("export-mapping", help="CSV exports of ID/UID mappings")
     sub.add_parser("selftest", help="synthetic end-to-end test against a loopback SCP")
@@ -4293,7 +4528,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _NEEDS_CONFIG = {"scan", "analyze", "report", "exclude", "approve", "echo",
-                 "send", "verify", "status", "export-mapping"}
+                 "send", "verify", "status", "export-mapping", "probe"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4321,6 +4556,7 @@ def main(argv: list[str] | None = None) -> int:
         "verify": lambda: cmd_verify(cfg, args),
         "status": lambda: cmd_status(cfg, args),
         "export-mapping": lambda: cmd_export_mapping(cfg, args),
+        "probe": lambda: cmd_probe(cfg, args),
         "selftest": lambda: cmd_selftest(cfg, args),
         "scp": lambda: cmd_scp(cfg, args),
     }
