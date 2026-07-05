@@ -112,13 +112,16 @@ DEFAULT_IS_FIX_TAGS = ["00181150", "00181151", "00181152"]  # ExposureTime, XRay
 
 # files.kind
 K_UNKNOWN, K_PART10, K_PREAMBLELESS, K_ORTHANC_JSON, K_NONDICOM, K_TRUNCATED, \
-    K_ZLIB_PART10, K_ZLIB_PREAMBLELESS, K_HEADER_ONLY = range(9)
+    K_ZLIB_PART10, K_ZLIB_PREAMBLELESS, K_HEADER_ONLY, K_ORTHANC_ATTACH = range(10)
 KIND_NAMES = {
     K_UNKNOWN: "unknown", K_PART10: "part10", K_PREAMBLELESS: "preambleless",
     K_ORTHANC_JSON: "orthanc-json", K_NONDICOM: "non-dicom", K_TRUNCATED: "truncated",
     K_ZLIB_PART10: "zlib+part10", K_ZLIB_PREAMBLELESS: "zlib+preambleless",
-    K_HEADER_ONLY: "header-only",
+    K_HEADER_ONLY: "header-only", K_ORTHANC_ATTACH: "orthanc-attach",
 }
+# "2;<md5hex>;" + gzip(DICOM-as-JSON): metadata attachment written by Orthanc
+# setups that index loose DICOM files in place (observed in the field)
+ORTHANC_ATTACH_RE = re.compile(rb"^\d{1,2};[0-9a-fA-F]{32};")
 DICOM_KINDS = {K_PART10, K_PREAMBLELESS, K_ZLIB_PART10, K_ZLIB_PREAMBLELESS}
 
 # files.scan_status
@@ -1098,6 +1101,8 @@ def sniff_kind(head: bytes, size: int) -> int:
     stripped = head.lstrip()
     if stripped[:1] in (b"{", b"["):
         return K_ORTHANC_JSON
+    if ORTHANC_ATTACH_RE.match(head):
+        return K_ORTHANC_ATTACH
     # Orthanc "zlib with size": uint64-LE uncompressed size + zlib stream
     if len(head) >= 10 and head[8] == 0x78 and head[9] in (0x01, 0x5E, 0x9C, 0xDA):
         usize = int.from_bytes(head[0:8], "little")
@@ -1859,7 +1864,7 @@ def _scan_one(src: SourceCfg, abs_path: str, base: dict) -> dict:
         except OSError as e:
             return {**base, "status": "error", "kind": K_UNKNOWN, "error": f"read: {e}"}
         kind = sniff_kind(head, base["size"])
-        if kind in (K_ORTHANC_JSON, K_NONDICOM):
+        if kind in (K_ORTHANC_JSON, K_NONDICOM, K_ORTHANC_ATTACH):
             return {**base, "status": "nondicom", "kind": kind}
         if kind == K_TRUNCATED:
             return {**base, "status": "error", "kind": kind, "error": "zero-length or truncated"}
@@ -3875,6 +3880,124 @@ def cmd_probe(cfg: Config, args) -> int:
     return 0
 
 
+def _manifest_tag(d: dict, tag8: str) -> str:
+    """Value of a tag from any Orthanc JSON flavor: DICOMweb ('00080018' ->
+    {'Value': [...], 'vr': ...}) or legacy ('0008,0018' -> {'Value': '...'}),
+    upper- or lowercase hex."""
+    v = None
+    for k in (tag8, tag8.lower(), f"{tag8[:4]},{tag8[4:]}", f"{tag8[:4]},{tag8[4:]}".lower()):
+        v = d.get(k)
+        if v is not None:
+            break
+    if not isinstance(v, dict):
+        return ""
+    val = v.get("Value")
+    if isinstance(val, list):
+        val = val[0] if val else ""
+    if isinstance(val, dict):  # DICOMweb PN: {"Alphabetic": "..."}
+        val = val.get("Alphabetic", "")
+    return str(val or "").strip()
+
+
+def _decode_manifest(path: str) -> list[dict] | None:
+    """Decode an Orthanc metadata attachment to a list of tag-dicts, or None."""
+    try:
+        with open(winpath(path), "rb") as f:
+            blob = f.read(32 << 20)
+    except OSError:
+        return None
+    data = None
+    m = ORTHANC_ATTACH_RE.match(blob)
+    if m:
+        payload = blob[m.end():]
+        for wb in (31, 15, -15):  # gzip observed in the field; be liberal
+            try:
+                data = zlib.decompress(payload, wb)
+                break
+            except zlib.error:
+                continue
+    elif blob[:1] in (b"{", b"[") or blob.lstrip()[:1] in (b"{", b"["):
+        data = blob
+    elif len(blob) > 10 and blob[8] == 0x78:  # zlib-with-size attachment
+        try:
+            data = zlib.decompress(blob[8:])
+        except zlib.error:
+            return None
+    if data is None or data.lstrip()[:1] not in (b"{", b"["):
+        return None
+    try:
+        root = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    entries = root if isinstance(root, list) else [root]
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def cmd_xcheck(cfg: Config, args) -> int:
+    """Completeness proof: every instance referenced by Orthanc's metadata
+    attachments must exist in the scanned inventory.  Run AFTER scans finish."""
+    conn = db_connect(cfg.general.db_path)
+    ensure_indexes(conn)
+    sources = args.source or [s.name for s in cfg.sources]
+    qmarks = ",".join("?" * len(sources))
+    rows = conn.execute(
+        f"SELECT r.path AS root, f.rel_path AS rel FROM files f JOIN roots r USING(root_id) "
+        f"WHERE r.source IN ({qmarks}) AND f.scan_status=? AND f.size BETWEEN 40 AND ?",
+        (*sources, FS_NONDICOM, 32 << 20)).fetchall()
+    log.info("xcheck: decoding up to %d candidate metadata attachments...", len(rows))
+    manifest: dict[str, dict] = {}
+    parsed = 0
+    for i, row in enumerate(rows, 1):
+        path = os.path.join(row["root"], row["rel"])
+        entries = _decode_manifest(path)
+        if entries is None:
+            continue
+        parsed += 1
+        for e in entries:
+            sop = _manifest_tag(e, "00080018")
+            if sop and sop not in manifest:
+                manifest[sop] = {
+                    "study_uid": _manifest_tag(e, "0020000D"),
+                    "pid": _manifest_tag(e, "00100020"),
+                    "name": _manifest_tag(e, "00100010"),
+                    "date": _manifest_tag(e, "00080020"),
+                    "manifest": path,
+                }
+        if i % 20000 == 0:
+            log.info("xcheck: %d/%d files, %d manifests, %d instances referenced",
+                     i, len(rows), parsed, len(manifest))
+    log.info("xcheck: %d manifests decoded, %d distinct instances referenced",
+             parsed, len(manifest))
+    if not manifest:
+        log.info("xcheck: nothing to check")
+        return 0
+    conn.execute("CREATE TEMP TABLE xc(sop TEXT PRIMARY KEY)")
+    conn.executemany("INSERT OR IGNORE INTO xc(sop) VALUES(?)",
+                     [(s,) for s in manifest])
+    missing = [r[0] for r in conn.execute(
+        "SELECT x.sop FROM xc x LEFT JOIN instances i ON i.sop_uid = x.sop "
+        "WHERE i.instance_id IS NULL")]
+    found = len(manifest) - len(missing)
+    outdir = Path(cfg.general.report_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    if missing:
+        f, w = _csv_writer(outdir / f"xcheck_missing_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                           ["sop_uid", "study_uid", "patient_id", "patient_name",
+                            "study_date", "manifest_file"])
+        with f:
+            for sop in missing:
+                info = manifest[sop]
+                w.writerow([sop, info["study_uid"], info["pid"], info["name"],
+                            info["date"], info["manifest"]])
+        log.warning("xcheck: %d instances referenced by Orthanc are MISSING from the "
+                    "inventory — see the CSV in %s. These lived in folders not covered "
+                    "by any [[source]] root (or were deleted).", len(missing), outdir)
+    log.info("xcheck: %d/%d referenced instances present in the scanned inventory (%.2f%%)",
+             found, len(manifest), 100.0 * found / len(manifest))
+    conn.close()
+    return 0 if not missing else 1
+
+
 # --------------------------------------------------------------------------
 # SECTION 16 — SELFTEST (synthetic data, loopback SCP, end-to-end)
 # --------------------------------------------------------------------------
@@ -4517,6 +4640,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--status", choices=["nondicom", "errors", "all"], default="all")
     sp.add_argument("--path", nargs="*", help="probe specific file paths instead of sampling")
 
+    sp = sub.add_parser("xcheck-orthanc",
+                        help="verify every instance referenced by Orthanc metadata "
+                             "attachments exists in the inventory (run AFTER scans)")
+    sp.add_argument("--source", nargs="*", help="sources holding attachment stores "
+                                                "(default: all)")
+
     sub.add_parser("status", help="one-screen progress summary")
     sub.add_parser("export-mapping", help="CSV exports of ID/UID mappings")
     sub.add_parser("selftest", help="synthetic end-to-end test against a loopback SCP")
@@ -4528,7 +4657,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _NEEDS_CONFIG = {"scan", "analyze", "report", "exclude", "approve", "echo",
-                 "send", "verify", "status", "export-mapping", "probe"}
+                 "send", "verify", "status", "export-mapping", "probe", "xcheck-orthanc"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4557,6 +4686,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": lambda: cmd_status(cfg, args),
         "export-mapping": lambda: cmd_export_mapping(cfg, args),
         "probe": lambda: cmd_probe(cfg, args),
+        "xcheck-orthanc": lambda: cmd_xcheck(cfg, args),
         "selftest": lambda: cmd_selftest(cfg, args),
         "scp": lambda: cmd_scp(cfg, args),
     }
