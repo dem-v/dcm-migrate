@@ -112,13 +112,16 @@ DEFAULT_IS_FIX_TAGS = ["00181150", "00181151", "00181152"]  # ExposureTime, XRay
 
 # files.kind
 K_UNKNOWN, K_PART10, K_PREAMBLELESS, K_ORTHANC_JSON, K_NONDICOM, K_TRUNCATED, \
-    K_ZLIB_PART10, K_ZLIB_PREAMBLELESS, K_HEADER_ONLY, K_ORTHANC_ATTACH = range(10)
+    K_ZLIB_PART10, K_ZLIB_PREAMBLELESS, K_HEADER_ONLY, K_ORTHANC_ATTACH, \
+    K_DICOMDIR = range(11)
 KIND_NAMES = {
     K_UNKNOWN: "unknown", K_PART10: "part10", K_PREAMBLELESS: "preambleless",
     K_ORTHANC_JSON: "orthanc-json", K_NONDICOM: "non-dicom", K_TRUNCATED: "truncated",
     K_ZLIB_PART10: "zlib+part10", K_ZLIB_PREAMBLELESS: "zlib+preambleless",
     K_HEADER_ONLY: "header-only", K_ORTHANC_ATTACH: "orthanc-attach",
+    K_DICOMDIR: "dicomdir",
 }
+DICOMDIR_SOP = "1.2.840.10008.1.3.10"  # Media Storage Directory Storage (index file)
 # "2;<md5hex>;" + gzip(DICOM-as-JSON): metadata attachment written by Orthanc
 # setups that index loose DICOM files in place (observed in the field)
 ORTHANC_ATTACH_RE = re.compile(rb"^\d{1,2};[0-9a-fA-F]{32};")
@@ -1248,6 +1251,19 @@ def safe_str(ds: Dataset, keyword: str, maxlen: int = 256) -> str:
 _IMAGE_SOP_PREFIX = "1.2.840.10008.5.1.4.1.1."
 
 
+def is_dicomdir(ds: Dataset) -> bool:
+    """A media directory (DICOMDIR): valid Part-10 but no SOPInstanceUID by design
+    — an index/catalog, never a migratable instance."""
+    fm = getattr(ds, "file_meta", None)
+    if fm is not None:
+        try:
+            if str(fm.get("MediaStorageSOPClassUID", "")) == DICOMDIR_SOP:
+                return True
+        except Exception:
+            pass
+    return Tag(0x0004, 0x1220) in ds or Tag(0x0004, 0x1130) in ds
+
+
 def extract_header(rr: ReadResult, src: SourceCfg, file_size: int) -> dict:
     """Pull the scan-time facts out of a header-only dataset.  Never raises."""
     ds = rr.ds
@@ -1880,8 +1896,12 @@ def _scan_one(src: SourceCfg, abs_path: str, base: dict) -> dict:
     finally:
         f.close()
     if not rec["sop_uid"]:
-        # a real DICM marker means it IS DICOM — an empty/UID-less parse is damage,
-        # not a decoy, and must surface as a hard problem rather than silently drop
+        # DICOMDIR / media directory: no SOPInstanceUID by design, no pixel data —
+        # a catalog file, not a migratable instance.  Skip, don't error.
+        if is_dicomdir(rr.ds):
+            return {**base, "status": "nondicom", "kind": K_DICOMDIR}
+        # otherwise a real DICM marker means it IS DICOM — an empty/UID-less parse is
+        # damage, not a decoy, and must surface as a hard problem rather than drop
         if kind in (K_PART10, K_ZLIB_PART10) or rec["sop_class"] or rec["study_uid"]:
             return {**base, "status": "error", "kind": rr.kind,
                     "error": "missing SOPInstanceUID (empty or truncated dataset)"}
@@ -4189,6 +4209,16 @@ def build_selftest_tree(root: Path) -> dict:
                    "CT003", "Ivanov Ivan")
     _write(caret, sante / "ct3" / "c.dcm")
     exp["caret_sop"] = "1.2.3.300.1"
+    # a DICOMDIR index (Part-10, but no SOPInstanceUID by design) must be skipped
+    dcmdir = Dataset()
+    dcmdir.FileSetID = "FILESET"
+    dcmdir.DirectoryRecordSequence = []
+    dfm = FileMetaDataset()
+    dfm.MediaStorageSOPClassUID = UID(DICOMDIR_SOP)
+    dfm.MediaStorageSOPInstanceUID = UID("1.2.3.888.1")
+    dfm.TransferSyntaxUID = ExplicitVRLittleEndian
+    dcmdir.file_meta = dfm
+    _write(dcmdir, sante / "ct1" / "DICOMDIR")
 
     # -- orthanc blob: 2-hex fan-out with part10, bare, zlib, json + junk decoys
     p10 = _mk_ds(CR_SOP, "1.2.3.400.1", "1.2.3.400", "1.2.3.400.9", "CR",
@@ -4434,7 +4464,10 @@ def cmd_selftest(_cfg, args) -> int:
         check(n_inst == 19, f"scan found 19 instances (got {n_inst})")
         n_nd = conn.execute("SELECT COUNT(*) FROM files WHERE scan_status=?",
                             (FS_NONDICOM,)).fetchone()[0]
-        check(n_nd == 2, f"2 non-dicom decoys (got {n_nd})")
+        check(n_nd == 3, f"3 non-dicom (2 decoys + 1 DICOMDIR) (got {n_nd})")
+        n_dcmdir = conn.execute("SELECT COUNT(*) FROM files WHERE kind=?",
+                                (K_DICOMDIR,)).fetchone()[0]
+        check(n_dcmdir == 1, f"DICOMDIR skipped not errored (got {n_dcmdir})")
         n_err = conn.execute("SELECT COUNT(*) FROM files WHERE scan_status=?",
                              (FS_ERROR,)).fetchone()[0]
         check(n_err == 2, f"2 unreadable files (got {n_err})")
