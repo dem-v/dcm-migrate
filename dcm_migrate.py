@@ -189,7 +189,10 @@ W_UID_REGEN = "W-UID-REGENERATED"
 W_STUDYUID_SYNTH = "W-STUDYUID-SYNTHESIZED"
 W_IS_ROUNDED = "W-IS-ROUNDED"
 W_DUP_CROSS = "W-DUP-CROSS-SOURCE"
+W_DUP_REGEN = "W-DUP-COLLISION-REGEN"      # same-UID/diff-pixels kept via new UIDs
+W_DUP_DROPPED = "W-DUP-COLLISION-DROPPED"  # same-UID/diff-pixels, losers discarded
 W_PID_REWRITE = "W-PID-REWRITE"
+W_IDENTITY_PLACEHOLDER = "W-IDENTITY-PLACEHOLDER"
 W_KEEPGB = "W-GB-DECLARATION-FIXED"
 I_NONDICOM = "I-NON-DICOM"
 
@@ -330,6 +333,15 @@ class GeneralCfg:
     scan_backend: str = "auto"             # auto | threads | processes
     sidecar_compress: bool = True          # use zstd when available (py3.14+)
     uid_root: str = "2.25"                 # root for regenerated UIDs (UUID-derived)
+    # same-SOPInstanceUID + DIFFERENT pixels (real collision): how to resolve
+    #   block          -> hard blocker, requires manual review (default, safest)
+    #   regenerate-uid -> keep ALL images, give losers fresh SOPInstanceUIDs (no loss)
+    #   keep-priority  -> keep one, DISCARD the others (data loss, logged loudly)
+    diff_content_policy: str = "block"
+    # studies with no PatientID AND no PatientName:
+    #   block       -> hard blocker (default)
+    #   placeholder -> synthesize "<Institution>-<YYYYMMDD>-<HHMMSS>-Missing"
+    no_identity_policy: str = "block"
 
 
 @dataclass
@@ -466,6 +478,10 @@ def load_config(path: str) -> Config:
                 errors.append(f"{c} rule {r.id!r}: bad regex: {e}")
         if s.fuji.enabled and s.pid_rules_mode == "off":
             s.pid_rules_mode = "required"
+    if cfg.general.diff_content_policy not in ("block", "regenerate-uid", "keep-priority"):
+        errors.append("[general].diff_content_policy must be block|regenerate-uid|keep-priority")
+    if cfg.general.no_identity_policy not in ("block", "placeholder"):
+        errors.append("[general].no_identity_policy must be block|placeholder")
     if not cfg.server.destinations:
         errors.append("no [server.destinations.*] defined (need at least 'other')")
     if "other" not in cfg.server.destinations and set(cfg.routing.precedence) - set(cfg.server.destinations):
@@ -493,6 +509,13 @@ pause_file  = "D:/migration/PAUSE"           # create this file => senders drain
 scan_backend = "auto"                        # auto | threads | processes
 sidecar_compress = true                      # zstd when available (Python 3.14+), else plain
 uid_root    = "2.25"                         # root for regenerated (invalid) UIDs
+# same SOPInstanceUID but DIFFERENT pixels (a real collision — the server would
+# silently keep only one): block (default) | regenerate-uid (keep all, fresh UIDs) |
+# keep-priority (keep one, discard others — logs the loss).  Run `dup-audit` first.
+diff_content_policy = "block"
+# studies with no PatientID AND no PatientName: block (default) |
+# placeholder (synthesize "<Institution>-<YYYYMMDD>-<HHMMSS>-Missing")
+no_identity_policy = "block"
 
 [server]
 host = "REPLACE_ME"                          # the DCM4CHEE IP / hostname
@@ -823,6 +846,7 @@ CREATE TABLE IF NOT EXISTS files(
   scan_status INTEGER NOT NULL DEFAULT 0,
   error TEXT,
   content_hash TEXT,
+  pixel_hash TEXT,
   UNIQUE(root_id, rel_path));
 CREATE TABLE IF NOT EXISTS patients(
   patient_pk INTEGER PRIMARY KEY,
@@ -872,6 +896,7 @@ CREATE TABLE IF NOT EXISTS instances(
   needs INTEGER NOT NULL DEFAULT 0,
   dup_group INTEGER,
   canonical INTEGER NOT NULL DEFAULT 1,
+  new_sop_uid TEXT,
   send_status INTEGER NOT NULL DEFAULT 0,
   attempts INTEGER NOT NULL DEFAULT 0,
   last_status INTEGER,
@@ -937,11 +962,14 @@ def db_init(path: str) -> None:
         conn.executescript(SCHEMA)
         conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','1')")
     # additive upgrades for databases created by older versions
-    try:
-        with conn:
-            conn.execute("ALTER TABLE files ADD COLUMN content_hash TEXT")
-    except sqlite3.OperationalError:
-        pass  # column already present
+    for ddl in ("ALTER TABLE files ADD COLUMN content_hash TEXT",
+                "ALTER TABLE files ADD COLUMN pixel_hash TEXT",
+                "ALTER TABLE instances ADD COLUMN new_sop_uid TEXT"):
+        try:
+            with conn:
+                conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # column already present
     conn.close()
 
 
@@ -1249,6 +1277,46 @@ def safe_str(ds: Dataset, keyword: str, maxlen: int = 256) -> str:
 
 
 _IMAGE_SOP_PREFIX = "1.2.840.10008.5.1.4.1.1."
+
+# SOP-class families whose instances DO carry PixelData: for these, a file with no
+# pixels is a genuinely damaged image (hard blocker).  Everything else under the
+# 1.2.840.10008.5.1.4.1.1.* tree that lacks pixels — Presentation States (.11),
+# Structured Reports/Key Objects (.88), Registrations/RWV/Fiducials (.66/.67),
+# Encapsulated docs (.104), RT (.481), waveforms (.9), spectroscopy (.4.2) — is a
+# valid non-image object that MUST be migrated, not flagged as broken.
+_PIXEL_IMAGE_SOP = (
+    "1.2.840.10008.5.1.4.1.1.1",     # CR / DX / MG / IO (+ .1.x variants)
+    "1.2.840.10008.5.1.4.1.1.2",     # CT (+ enhanced .2.1/.2.2)
+    "1.2.840.10008.5.1.4.1.1.3",     # US multi-frame
+    "1.2.840.10008.5.1.4.1.1.4",     # MR (+ enhanced); .4.2 excluded below
+    "1.2.840.10008.5.1.4.1.1.6",     # US
+    "1.2.840.10008.5.1.4.1.1.7",     # Secondary Capture (+ multiframe .7.x)
+    "1.2.840.10008.5.1.4.1.1.12",    # XA / XRF (+ enhanced)
+    "1.2.840.10008.5.1.4.1.1.13",    # X-Ray 3D
+    "1.2.840.10008.5.1.4.1.1.14",    # Intravascular OCT
+    "1.2.840.10008.5.1.4.1.1.20",    # NM
+    "1.2.840.10008.5.1.4.1.1.30",    # Parametric Map
+    "1.2.840.10008.5.1.4.1.1.77",    # VL / ophthalmic / endoscopy
+    "1.2.840.10008.5.1.4.1.1.128",   # PET
+    "1.2.840.10008.5.1.4.1.1.130",   # Enhanced PET
+    "1.2.840.10008.5.1.4.1.1.481.1",  # RT Image
+)
+_NONPIXEL_EXCEPTIONS = {
+    "1.2.840.10008.5.1.4.1.1.4.2",   # MR Spectroscopy (no PixelData)
+}
+
+
+def sop_needs_pixels(uid: str) -> bool:
+    """True only for SOP classes that carry PixelData — i.e. where a missing-pixel
+    file is a defect.  Non-image IODs (PR/SR/SEG-less/REG/RWV/...) return False."""
+    if not uid or uid in _NONPIXEL_EXCEPTIONS:
+        return False
+    return any(uid == p or uid.startswith(p + ".") for p in _PIXEL_IMAGE_SOP)
+
+
+def image_sop_class_ids(conn: sqlite3.Connection) -> set[int]:
+    return {cid for cid, uid in conn.execute("SELECT id, uid FROM sop_classes")
+            if sop_needs_pixels(uid)}
 
 
 def is_dicomdir(ds: Dataset) -> bool:
@@ -1607,6 +1675,14 @@ def fuji_pid(site: str, study_date: str, ordinal: int) -> str:
     return f"{site}{month}{yy}{ordinal:03d}"
 
 
+def placeholder_pid(institution: str, study_date: str, study_time: str) -> str:
+    """Synthetic PatientID for studies with no identity: <Inst>-<YYYYMMDD>-<HHMMSS>-Missing."""
+    inst = re.sub(r"[^A-Za-z0-9]+", "_", (institution or "").strip()).strip("_")[:24] or "UNKNOWN"
+    d = (re.sub(r"\D", "", study_date or "")[:8] or "00000000").ljust(8, "0")
+    t = (re.sub(r"\D", "", study_time or "")[:6]).ljust(6, "0")
+    return f"{inst}-{d}-{t}-Missing"[:64]
+
+
 def synth_study_uid(uid_root: str, source: str, pid: str, study_date: str,
                     accession: str, fallback: str) -> str:
     """Deterministic StudyInstanceUID for files that lack one.  Groups siblings
@@ -1844,6 +1920,12 @@ class Transformer:
             self._pass_pn(ds, changes)
         if needs & N_PID:
             self._pass_pid(ds, pid_new, changes)
+        new_sop = inst["new_sop_uid"] if "new_sop_uid" in inst.keys() else None
+        if new_sop:  # duplicate-collision resolution: distinct image gets a fresh UID
+            tag = Tag(0x0008, 0x0018)
+            old = safe_str(ds, "SOPInstanceUID", 128)
+            ds[tag] = DataElement(tag, "UI", new_sop)
+            self._record(changes, tag, "UI", old, new_sop, "dup-collision-uid")
         self._pass_oas(ds, changes)
         self._pass_filemeta(ds, guess_transfer_syntax(rr))
         return ds, changes
@@ -2350,82 +2432,178 @@ def _an_uid_remaps(conn, cfg: Config) -> None:
                      (row["study_uid"], "study", synth, "missing-study-uid"))
 
 
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
 def _an_dedupe(conn, cfg: Config, run: int) -> None:
     prio = {s.name: s.priority for s in cfg.sources}
+    image_ids = image_sop_class_ids(conn)
+    ts_rev = {r["id"]: r["uid"] for r in conn.execute("SELECT id, uid FROM xfer")}
+    policy = cfg.general.diff_content_policy
+
+    def is_broken_image(r) -> bool:
+        # missing pixels only matters for SOP classes that should have them
+        return bool(r["facts"] & F_NO_PIXELS) and r["sop_class_id"] in image_ids
+
+    def keep(iid):
+        conn.execute("UPDATE instances SET dup_group=? WHERE instance_id=?", (g, iid))
+
+    def drop(iid):
+        conn.execute("UPDATE instances SET canonical=0, send_status=?, dup_group=? "
+                     "WHERE instance_id=?", (S_SKIPPED_DUP, g, iid))
+
     dup_uids = [r[0] for r in conn.execute(
         "SELECT sop_uid FROM instances WHERE send_status!=? "
         "GROUP BY sop_uid HAVING COUNT(*)>1", (S_EXCLUDED,))]
-    log.info("analyze: %d duplicated SOPInstanceUIDs to resolve", len(dup_uids))
-    n_dedup, n_conflict, n_pixelless_dropped = 0, 0, 0
+    log.info("analyze: %d duplicated SOPInstanceUIDs to resolve (diff-content policy=%s)",
+             len(dup_uids), policy)
+    n_dedup = n_conflict = n_pixelless_dropped = n_regen = n_dropped = n_benign_px = 0
     for g, sop_uid in enumerate(dup_uids, start=1):
         rows = conn.execute(
-            "SELECT i.instance_id, i.source, i.facts, f.file_id, f.size, f.content_hash "
+            "SELECT i.instance_id, i.source, i.facts, i.sop_class_id, i.ts_id, f.file_id,"
+            " f.size, f.mtime_ns, f.content_hash, f.pixel_hash "
             "FROM instances i JOIN files f USING(file_id) "
             "WHERE i.sop_uid=? AND i.send_status!=?", (sop_uid, S_EXCLUDED)).fetchall()
-        with_pixels = [r for r in rows if not r["facts"] & F_NO_PIXELS]
-        pixelless = [r for r in rows if r["facts"] & F_NO_PIXELS]
-        if with_pixels and pixelless:  # header-only attachments auto-lose
+        with_pixels = [r for r in rows if not is_broken_image(r)]
+        pixelless = [r for r in rows if is_broken_image(r)]
+        if with_pixels and pixelless:  # a full copy beats a broken/header-only one
             for r in pixelless:
-                conn.execute("UPDATE instances SET canonical=0, send_status=?, dup_group=? "
-                             "WHERE instance_id=?", (S_SKIPPED_DUP, g, r["instance_id"]))
+                drop(r["instance_id"])
                 n_pixelless_dropped += 1
         contenders = with_pixels or pixelless
         if len(contenders) == 1:
-            conn.execute("UPDATE instances SET dup_group=? WHERE instance_id=?",
-                         (g, contenders[0]["instance_id"]))
+            keep(contenders[0]["instance_id"])
             continue
-        sizes = {r["size"] for r in contenders}
-        same = False
-        if len(sizes) == 1:
-            hashes = set()
+        # winner preference: source priority, then newest file, then lowest id
+        contenders.sort(key=lambda r: (prio.get(r["source"], 999),
+                                       -(r["mtime_ns"] or 0), r["instance_id"]))
+
+        # tier 1 — byte-identical (cached full-file hash): certainly benign
+        byte_same = False
+        if len({r["size"] for r in contenders}) == 1:
+            hs = set()
             for r in contenders:
-                h = r["content_hash"]  # cached across analyze runs (reset when file changes)
+                h = r["content_hash"]
                 if not h:
                     try:
                         h = sha256_file(_abs_path(conn, r["file_id"]))
-                        conn.execute("UPDATE files SET content_hash=? WHERE file_id=?",
-                                     (h, r["file_id"]))
-                    except OSError as e:
-                        h = f"unreadable:{r['file_id']}:{e}"
-                hashes.add(h)
-            same = len(hashes) == 1
-        contenders.sort(key=lambda r: (prio.get(r["source"], 999), r["instance_id"]))
-        if same:
-            winner = contenders[0]
+                    except OSError:
+                        h = f"unreadable:{r['file_id']}"
+                    conn.execute("UPDATE files SET content_hash=? WHERE file_id=?",
+                                 (h, r["file_id"]))
+                hs.add(h)
+            byte_same = len(hs) == 1 and _HEX64.fullmatch(next(iter(hs)) or "") is not None
+        if byte_same:
+            keep(contenders[0]["instance_id"])
             for r in contenders[1:]:
-                conn.execute("UPDATE instances SET canonical=0, send_status=?, dup_group=? "
-                             "WHERE instance_id=?", (S_SKIPPED_DUP, g, r["instance_id"]))
+                drop(r["instance_id"])
                 n_dedup += 1
-            conn.execute("UPDATE instances SET dup_group=? WHERE instance_id=?",
-                         (g, winner["instance_id"]))
-        else:
-            n_conflict += 1
-            detail = {"sop_uid": sop_uid, "candidates": [
+            continue
+
+        # tier 2 — compare PIXEL data, transfer-syntax-aware (a raw pixel hash would
+        # falsely differ across TS for the same image, so only flag a collision when
+        # two copies share a TS yet differ in pixels)
+        pinfo = []
+        for r in contenders:
+            ph = r["pixel_hash"]
+            if not ph:
+                ph = _pixel_sha(_abs_path(conn, r["file_id"]))
+                conn.execute("UPDATE files SET pixel_hash=? WHERE file_id=?", (ph, r["file_id"]))
+            pinfo.append((r, ph, ts_rev.get(r["ts_id"], "")))
+        good = [(r, ph, ts) for (r, ph, ts) in pinfo if _HEX64.fullmatch(ph or "")]
+        by_ts: dict[str, set] = {}
+        for r, ph, ts in good:
+            by_ts.setdefault(ts, set()).add(ph)
+        danger = any(len(hh) > 1 for hh in by_ts.values())
+
+        if danger:
+            detail = {"sop_uid": sop_uid, "policy": policy, "candidates": [
                 {"source": r["source"], "path": _abs_path(conn, r["file_id"]),
-                 "size": r["size"], "instance_id": r["instance_id"]} for r in contenders]}
+                 "size": r["size"], "instance_id": r["instance_id"],
+                 "ts": ts, "pixel_hash": ph[:12]} for (r, ph, ts) in pinfo]}
+            if policy == "block":
+                for r in contenders:
+                    keep(r["instance_id"])
+                conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
+                             "VALUES(?,?,?,?,?,?)",
+                             (run, SEV_HARD, H_DUP_CONFLICT, "dup", g,
+                              json.dumps(detail, ensure_ascii=False)))
+                n_conflict += 1
+            elif policy == "keep-priority":
+                keep(contenders[0]["instance_id"])
+                for r in contenders[1:]:
+                    drop(r["instance_id"])
+                    n_dropped += 1
+                conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
+                             "VALUES(?,?,?,?,?,?)",
+                             (run, SEV_WARN, W_DUP_DROPPED, "dup", g,
+                              json.dumps(detail, ensure_ascii=False)))
+            else:  # regenerate-uid — keep ALL images, give losers fresh SOPInstanceUIDs
+                keep(contenders[0]["instance_id"])
+                for r in contenders[1:]:
+                    new = make_uid(cfg.general.uid_root, "dupcollide", sop_uid,
+                                   str(r["instance_id"]))
+                    conn.execute("UPDATE instances SET new_sop_uid=?, needs=needs|?, dup_group=? "
+                                 "WHERE instance_id=?", (new, N_UIDFIX, g, r["instance_id"]))
+                    n_regen += 1
+                conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
+                             "VALUES(?,?,?,?,?,?)",
+                             (run, SEV_WARN, W_DUP_REGEN, "dup", g,
+                              json.dumps(detail, ensure_ascii=False)))
+        elif not good:  # nothing readable → cannot verify → conservative block
             for r in contenders:
-                conn.execute("UPDATE instances SET dup_group=? WHERE instance_id=?",
-                             (g, r["instance_id"]))
-            conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) VALUES(?,?,?,?,?,?)",
+                keep(r["instance_id"])
+            conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
+                         "VALUES(?,?,?,?,?,?)",
                          (run, SEV_HARD, H_DUP_CONFLICT, "dup", g,
-                          json.dumps(detail, ensure_ascii=False)))
+                          json.dumps({"sop_uid": sop_uid, "reason": "pixels unreadable",
+                                      "candidates": [{"source": r["source"],
+                                                      "path": _abs_path(conn, r["file_id"]),
+                                                      "instance_id": r["instance_id"]}
+                                                     for r in contenders]}, ensure_ascii=False)))
+            n_conflict += 1
+        else:  # same pixels (metadata-only diff) or re-compressed copy → benign
+            winner = good[0][0]
+            keep(winner["instance_id"])
+            for r in contenders:
+                if r["instance_id"] != winner["instance_id"]:
+                    drop(r["instance_id"])
+                    n_dedup += 1
+            n_benign_px += 1
         if g % 5000 == 0:
             log.info("analyze: dedupe %d/%d groups", g, len(dup_uids))
             conn.commit()
-    # pixel-less instances that have NO full copy anywhere
-    for row in conn.execute(
-            "SELECT instance_id, sop_uid, file_id, source FROM instances "
-            "WHERE canonical=1 AND send_status!=? AND (facts & ?)!=0", (S_EXCLUDED, F_NO_PIXELS)):
-        conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) VALUES(?,?,?,?,?,?)",
-                     (run, SEV_HARD, H_PIXELLESS_ONLY, "instance", row["instance_id"],
-                      json.dumps({"source": row["source"], "sop_uid": row["sop_uid"],
-                                  "path": _abs_path(conn, row["file_id"])}, ensure_ascii=False)))
-    if n_dedup or n_pixelless_dropped:
+    # genuinely broken images: an IMAGE-class instance with no pixels and no full
+    # copy elsewhere.  Non-image IODs (PR/SR/REG/RWV/…) with no pixels are valid and
+    # deliberately NOT flagged here — they must migrate.
+    if image_ids:
+        placeholders = ",".join("?" * len(image_ids))
+        for row in conn.execute(
+                f"SELECT instance_id, sop_uid, file_id, source FROM instances "
+                f"WHERE canonical=1 AND send_status!=? AND (facts & ?)!=0 "
+                f"AND sop_class_id IN ({placeholders})",
+                (S_EXCLUDED, F_NO_PIXELS, *image_ids)):
+            conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) VALUES(?,?,?,?,?,?)",
+                         (run, SEV_HARD, H_PIXELLESS_ONLY, "instance", row["instance_id"],
+                          json.dumps({"source": row["source"], "sop_uid": row["sop_uid"],
+                                      "path": _abs_path(conn, row["file_id"])}, ensure_ascii=False)))
+    if n_dedup or n_pixelless_dropped or n_benign_px:
         conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) VALUES(?,?,?,?,?,?)",
                      (run, SEV_WARN, W_DUP_CROSS, "aggregate", None,
-                      json.dumps({"deduped": n_dedup, "headeronly_dropped": n_pixelless_dropped})))
-    log.info("analyze: dedupe done (%d deduped, %d conflicts, %d header-only dropped)",
-             n_dedup, n_conflict, n_pixelless_dropped)
+                      json.dumps({"byte_identical_deduped": n_dedup,
+                                  "same_pixels_deduped": n_benign_px,
+                                  "headeronly_dropped": n_pixelless_dropped})))
+    if n_regen:
+        conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) VALUES(?,?,?,?,?,?)",
+                     (run, SEV_WARN, W_DUP_REGEN, "aggregate", None,
+                      json.dumps({"collisions_preserved_via_new_uid": n_regen})))
+    if n_dropped:
+        conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) VALUES(?,?,?,?,?,?)",
+                     (run, SEV_WARN, W_DUP_DROPPED, "aggregate", None,
+                      json.dumps({"collision_images_DISCARDED": n_dropped})))
+    log.info("analyze: dedupe done (byte-dup=%d, pixel-dup=%d, header-only=%d, "
+             "collisions: block=%d regen=%d dropped=%d)",
+             n_dedup, n_benign_px, n_pixelless_dropped, n_conflict, n_regen, n_dropped)
 
 
 def _study_source_map(conn) -> dict[int, str]:
@@ -2511,16 +2689,30 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
             conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) VALUES(?,?,?,?,?,?)",
                          (run, SEV_WARN, W_PID_REWRITE, "aggregate", None,
                           json.dumps({"source": src.name, "studies": n_rewritten})))
-    # studies with no identity at all
+    # studies with no identity at all: block, or synthesize a placeholder ID
+    placeholder = cfg.general.no_identity_policy == "placeholder"
+    n_placeholder = 0
     for row in conn.execute(
-            "SELECT s.study_pk, s.study_uid, s.source FROM studies s "
-            "LEFT JOIN patients p USING(patient_pk) "
+            "SELECT s.study_pk, s.study_uid, s.source, s.institution, s.study_date, s.study_time "
+            "FROM studies s LEFT JOIN patients p USING(patient_pk) "
             "WHERE COALESCE(p.pid_raw,'')='' AND COALESCE(p.name_raw,'')='' "
             "AND s.pid_new IS NULL AND EXISTS (SELECT 1 FROM instances i WHERE i.study_pk=s.study_pk "
-            " AND i.canonical=1 AND i.send_status NOT IN (?,?))", (S_EXCLUDED, S_SKIPPED_DUP)):
+            " AND i.canonical=1 AND i.send_status NOT IN (?,?))", (S_EXCLUDED, S_SKIPPED_DUP)).fetchall():
+        if placeholder:
+            pid = placeholder_pid(row["institution"], row["study_date"], row["study_time"])
+            conn.execute("UPDATE studies SET pid_new=?, pid_rule=? WHERE study_pk=?",
+                         (pid, "no-identity-placeholder", row["study_pk"]))
+            conn.execute("UPDATE instances SET needs=needs|? WHERE study_pk=?",
+                         (N_PID, row["study_pk"]))
+            n_placeholder += 1
+        else:
+            conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) VALUES(?,?,?,?,?,?)",
+                         (run, SEV_HARD, H_NO_IDENTITY, "study", row["study_pk"],
+                          json.dumps({"source": row["source"], "study_uid": row["study_uid"]})))
+    if n_placeholder:
         conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) VALUES(?,?,?,?,?,?)",
-                     (run, SEV_HARD, H_NO_IDENTITY, "study", row["study_pk"],
-                      json.dumps({"source": row["source"], "study_uid": row["study_uid"]})))
+                     (run, SEV_WARN, W_IDENTITY_PLACEHOLDER, "aggregate", None,
+                      json.dumps({"studies": n_placeholder})))
 
 
 def _an_routing(conn, cfg: Config) -> None:
@@ -2558,7 +2750,7 @@ def cmd_analyze(cfg: Config, args) -> int:
     with conn:
         disarm_gate(conn, "analyze")
         conn.execute("DELETE FROM problems")
-        conn.execute("UPDATE instances SET needs=0, dup_group=NULL, canonical=1, "
+        conn.execute("UPDATE instances SET needs=0, dup_group=NULL, canonical=1, new_sop_uid=NULL, "
                      "send_status=CASE WHEN send_status=? THEN ? ELSE send_status END "
                      "WHERE send_status!=?", (S_SKIPPED_DUP, S_PENDING, S_EXCLUDED))
         conn.execute("UPDATE studies SET pid_new=NULL, pid_rule=NULL")
@@ -3396,7 +3588,8 @@ class Sender(threading.Thread):
                 self._record_result(inst, assoc_id, None, "perm", 0, 0, f"read: {e}")
                 return True
             try:
-                if inst["needs"]:
+                new_sop = inst["new_sop_uid"] if "new_sop_uid" in inst.keys() else None
+                if inst["needs"] or new_sop:
                     tr = Transformer(self.cfg, src,
                                      lambda old, t: self.uid_remap.get((old, t)))
                     ds, changes = tr.transform(rr, inst, inst["pid_new"])
@@ -4018,6 +4211,106 @@ def cmd_xcheck(cfg: Config, args) -> int:
     return 0 if not missing else 1
 
 
+def _pixeldata_hash(path: str, max_bytes: int = 300 << 20) -> tuple[str, str, int]:
+    """(transfer_syntax, pixeldata_sha256|reason, size).  Read-only, never raises."""
+    try:
+        size = os.path.getsize(winpath(path))
+    except OSError as e:
+        return "", f"stat-failed:{e}", 0
+    if size > max_bytes:
+        return "", "too-large-to-hash", size
+    try:
+        ds = dcmread(winpath(path), force=True)
+        ts = ""
+        fm = getattr(ds, "file_meta", None)
+        if fm is not None:
+            ts = str(fm.get("TransferSyntaxUID", "") or "")
+        item = ds.get_item(Tag(0x7FE0, 0x0010))
+        if item is None or item.value in (None, b""):
+            return ts, "no-pixeldata", size
+        val = item.value
+        raw = bytes(val) if isinstance(val, (bytes, bytearray, memoryview)) else str(val).encode()
+        return ts, hashlib.sha256(raw).hexdigest(), size
+    except Exception as e:
+        return "", f"read-failed:{str(e)[:60]}", size
+
+
+def _pixel_sha(path: str, max_bytes: int = 300 << 20) -> str:
+    """Just the PixelData sha256 (or a non-hex reason token).  For dedupe."""
+    return _pixeldata_hash(path, max_bytes)[1]
+
+
+def cmd_dup_audit(cfg: Config, args) -> int:
+    """Sample H-DUP-CONFLICT groups and characterize them: cross-root vs same-root,
+    same transfer syntax, and whether PixelData is identical.  Read-only — informs
+    the diff-content resolution policy before any irreversible send."""
+    conn = db_connect(cfg.general.db_path, readonly=True)
+    root_prefixes = []
+    for s in cfg.sources:
+        for r in s.roots:
+            root_prefixes.append((os.path.abspath(r).lower(), f"{s.name}:{r}"))
+
+    def root_of(path: str) -> str:
+        p = os.path.abspath(path).lower()
+        for pref, label in root_prefixes:
+            if p.startswith(pref):
+                return label
+        return "?"
+
+    rows = conn.execute(
+        "SELECT detail FROM problems WHERE code=? AND resolved=0 ORDER BY RANDOM() LIMIT ?",
+        (H_DUP_CONFLICT, args.sample)).fetchall()
+    total_conf = conn.execute("SELECT COUNT(*) FROM problems WHERE code=? AND resolved=0",
+                              (H_DUP_CONFLICT,)).fetchone()[0]
+    conn.close()
+    if not rows:
+        print("no unresolved H-DUP-CONFLICT groups")
+        return 0
+    print(f"sampling {len(rows)} of {total_conf:,} dup-conflict groups\n")
+    cats: dict[str, int] = {}
+    examples: dict[str, str] = {}
+    for row in rows:
+        detail = json.loads(row["detail"])
+        cands = detail.get("candidates", [])
+        roots, tss, phs, reasons = set(), set(), set(), []
+        for c in cands:
+            ts, ph, _sz = _pixeldata_hash(c["path"])
+            roots.add(root_of(c["path"]))
+            tss.add(ts)
+            phs.add(ph)
+            if not ph.count("0") or "failed" in ph or ph in ("too-large-to-hash", "no-pixeldata"):
+                if not re.fullmatch(r"[0-9a-f]{64}", ph):
+                    reasons.append(ph)
+        cross = "cross-root" if len(roots) > 1 else "same-root"
+        hashes = {h for h in phs if re.fullmatch(r"[0-9a-f]{64}", h or "")}
+        if reasons and not hashes:
+            cat = f"{cross}/uncheckable"
+        elif len(tss) > 1 and len(hashes) > 1:
+            cat = f"{cross}/diff-TS(pixels-not-comparable)"
+        elif len(hashes) == 1 and len(phs) == 1:
+            cat = f"{cross}/BENIGN-same-pixels"
+        elif len(hashes) > 1:
+            cat = f"{cross}/DANGER-diff-pixels"
+        else:
+            cat = f"{cross}/unknown"
+        cats[cat] = cats.get(cat, 0) + 1
+        if cat not in examples:
+            examples[cat] = " | ".join(f"{root_of(c['path'])} ts={_pixeldata_hash(c['path'])[0][-8:]}"
+                                       for c in cands[:3])
+    print("category                                    count")
+    for cat, n in sorted(cats.items(), key=lambda kv: -kv[1]):
+        print(f"  {cat:<42} {n:>5}  ({100*n/len(rows):.0f}%)")
+    print("\nexamples:")
+    for cat, ex in examples.items():
+        print(f"  [{cat}]\n    {ex}")
+    danger = sum(n for c, n in cats.items() if "DANGER" in c)
+    print(f"\n=> {danger}/{len(rows)} sampled groups have SAME UID + DIFFERENT PIXELS "
+          f"(the real landmine). Extrapolated over {total_conf:,}: ~{danger*total_conf//len(rows):,}.")
+    print("   benign (same pixels, or metadata/TS-only differences) can be auto-resolved "
+          "by priority; danger groups need UID regeneration or manual review.")
+    return 0
+
+
 # --------------------------------------------------------------------------
 # SECTION 16 — SELFTEST (synthetic data, loopback SCP, end-to-end)
 # --------------------------------------------------------------------------
@@ -4219,6 +4512,27 @@ def build_selftest_tree(root: Path) -> dict:
     dfm.TransferSyntaxUID = ExplicitVRLittleEndian
     dcmdir.file_meta = dfm
     _write(dcmdir, sante / "ct1" / "DICOMDIR")
+    # a Presentation State: valid DICOM, no PixelData by design — MUST be sent,
+    # never flagged pixelless (regression guard for the SOP-class gating)
+    pr = Dataset()
+    pr.SOPClassUID = "1.2.840.10008.5.1.4.1.1.11.1"  # Grayscale Softcopy PS
+    pr.SOPInstanceUID = "1.2.3.950.1"
+    pr.StudyInstanceUID = "1.2.3.950"
+    pr.SeriesInstanceUID = "1.2.3.950.9"
+    pr.Modality = "PR"
+    pr.PatientID = "PR001"
+    pr.PatientName = "Presentation^State"
+    pr.PatientBirthDate = "19800101"
+    pr.PatientSex = "O"
+    pr.StudyDate = "20200115"
+    pr.ContentLabel = "ANNOTATION"
+    pfm = FileMetaDataset()
+    pfm.MediaStorageSOPClassUID = UID("1.2.840.10008.5.1.4.1.1.11.1")
+    pfm.MediaStorageSOPInstanceUID = UID("1.2.3.950.1")
+    pfm.TransferSyntaxUID = ExplicitVRLittleEndian
+    pr.file_meta = pfm
+    _write(pr, sante / "ps" / "pr.dcm")
+    exp["pr_sop"] = "1.2.3.950.1"
 
     # -- orthanc blob: 2-hex fan-out with part10, bare, zlib, json + junk decoys
     p10 = _mk_ds(CR_SOP, "1.2.3.400.1", "1.2.3.400", "1.2.3.400.9", "CR",
@@ -4432,6 +4746,12 @@ def _selftest_units(check) -> None:
     check(w.is_active(_dt.datetime(2026, 7, 3, 23, 0)) and
           not w.is_active(_dt.datetime(2026, 7, 3, 12, 0)), "active window")
     check(translit_cyrillic("Щукін") == "Shchukin", "translit")
+    check(placeholder_pid("City Hospital #1", "20240115", "093012.5") == "City_Hospital_1-20240115-093012-Missing",
+          f"placeholder pid (got {placeholder_pid('City Hospital #1', '20240115', '093012.5')})")
+    check(placeholder_pid("", "", "") == "UNKNOWN-00000000-000000-Missing", "placeholder pid empty")
+    check(sop_needs_pixels("1.2.840.10008.5.1.4.1.1.2") and
+          not sop_needs_pixels("1.2.840.10008.5.1.4.1.1.11.1") and
+          not sop_needs_pixels("1.2.840.10008.5.1.4.1.1.88.11"), "sop_needs_pixels")
 
 
 def cmd_selftest(_cfg, args) -> int:
@@ -4461,7 +4781,7 @@ def cmd_selftest(_cfg, args) -> int:
         cmd_scan(cfg, _Args())
         conn = db_connect(cfg.general.db_path)
         n_inst = conn.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
-        check(n_inst == 19, f"scan found 19 instances (got {n_inst})")
+        check(n_inst == 20, f"scan found 20 instances (got {n_inst})")
         n_nd = conn.execute("SELECT COUNT(*) FROM files WHERE scan_status=?",
                             (FS_NONDICOM,)).fetchone()[0]
         check(n_nd == 3, f"3 non-dicom (2 decoys + 1 DICOMDIR) (got {n_nd})")
@@ -4484,6 +4804,8 @@ def cmd_selftest(_cfg, args) -> int:
         check(probs.get(H_PID_RULE_MISS) == 1, f"1 fuji site miss (got {probs.get(H_PID_RULE_MISS)})")
         check(probs.get(H_TRUNCATED, 0) + probs.get(H_UNREADABLE, 0) == 2,
               "2 hard unreadable/truncated")
+        check(probs.get(H_PIXELLESS_ONLY, 0) == 0,
+              f"Presentation State not flagged pixelless (got {probs.get(H_PIXELLESS_ONLY, 0)})")
         dup_skipped = conn.execute(
             "SELECT COUNT(*) FROM instances WHERE sop_uid=? AND send_status=?",
             (exp["dup_same_sop"], S_SKIPPED_DUP)).fetchone()[0]
@@ -4521,7 +4843,7 @@ def cmd_selftest(_cfg, args) -> int:
         check(n_fail == 0, f"no permanent failures (got {n_fail})")
         n_sent = conn.execute("SELECT COUNT(*) FROM instances WHERE send_status IN (?,?)",
                               (S_SENT, S_SENT_WARN)).fetchone()[0]
-        check(n_sent == 16, f"16 instances sent (got {n_sent})")
+        check(n_sent == 17, f"17 instances sent (got {n_sent})")
         conn.close()
 
         # ---- inspect received objects ----
@@ -4564,6 +4886,7 @@ def cmd_selftest(_cfg, args) -> int:
               "missing StudyInstanceUID synthesized")
         check(exp["bare_sop"] in rx and exp["zlib_sop"] in rx,
               "preambleless + zlib blobs delivered")
+        check(exp["pr_sop"] in rx, "Presentation State (no pixels) was sent, not blocked")
 
         rc = cmd_verify(cfg, _Args())
         check(rc == 0, "verify all MATCH")
@@ -4673,6 +4996,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--status", choices=["nondicom", "errors", "all"], default="all")
     sp.add_argument("--path", nargs="*", help="probe specific file paths instead of sampling")
 
+    sp = sub.add_parser("dup-audit",
+                        help="characterize H-DUP-CONFLICT groups (cross-root / TS / "
+                             "pixel-identity) to choose a resolution policy")
+    sp.add_argument("--sample", type=int, default=300, help="how many conflict groups to sample")
+
     sp = sub.add_parser("xcheck-orthanc",
                         help="verify every instance referenced by Orthanc metadata "
                              "attachments exists in the inventory (run AFTER scans)")
@@ -4690,7 +5018,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _NEEDS_CONFIG = {"scan", "analyze", "report", "exclude", "approve", "echo",
-                 "send", "verify", "status", "export-mapping", "probe", "xcheck-orthanc"}
+                 "send", "verify", "status", "export-mapping", "probe", "xcheck-orthanc",
+                 "dup-audit"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4719,6 +5048,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": lambda: cmd_status(cfg, args),
         "export-mapping": lambda: cmd_export_mapping(cfg, args),
         "probe": lambda: cmd_probe(cfg, args),
+        "dup-audit": lambda: cmd_dup_audit(cfg, args),
         "xcheck-orthanc": lambda: cmd_xcheck(cfg, args),
         "selftest": lambda: cmd_selftest(cfg, args),
         "scp": lambda: cmd_scp(cfg, args),
