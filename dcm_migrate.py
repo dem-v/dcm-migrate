@@ -298,6 +298,9 @@ class FujiCfg:
     sites: list[str] = field(default_factory=lambda: ["8K", "9K"])
     # folder path fragment (matched case-insensitively against the file's absolute path) -> site code
     folder_site_map: dict[str, str] = field(default_factory=dict)
+    # site code for studies that match neither InstitutionName flag nor folder map
+    # (mixed/legacy sources).  "" => such studies become H-PID-RULE-MISS blockers.
+    fallback_site: str = ""
 
 
 @dataclass
@@ -632,11 +635,15 @@ pid_rules_mode = "required"      # every study MUST get a generated ID
 [source.fuji]
 enabled = true                   # study-level ID: {site}{M}{YY}{###}
 sites = ["8K", "9K"]             # looked for as substrings of InstitutionName
+fallback_site = "XK"             # mixed/legacy studies with no clear site -> XK marker
+                                 # ("" would make them H-PID-RULE-MISS blockers instead)
 # Files without a site flag in InstitutionName get their site from the folder
 # they came from (case-insensitive substring match on the absolute path):
 [source.fuji.folder_site_map]
-#"\\fuji\\site_a" = "8K"
-#"\\fuji\\site_b" = "9K"
+#'\8ksante' = "8K"
+#'\8kdisk2' = "8K"
+#'\8k'      = "8K"
+#'\9k'      = "9K"
 '''
 
 # --------------------------------------------------------------------------
@@ -2645,6 +2652,8 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
                 path = _abs_path(conn, inst["file_id"]) if inst else ""
                 site = fuji_site_for(src, row["institution"], path)
                 if site is None:
+                    site = src.fuji.fallback_site or None
+                if site is None:
                     conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
                                  "VALUES(?,?,?,?,?,?)",
                                  (run, SEV_HARD, H_PID_RULE_MISS, "study", pk,
@@ -4146,22 +4155,40 @@ def _decode_manifest(path: str) -> list[dict] | None:
     return [e for e in entries if isinstance(e, dict)]
 
 
+def _walk_metadata_dir(root: str, cap_bytes: int = 32 << 20) -> Iterator[str]:
+    """Yield candidate metadata files under an arbitrary directory tree."""
+    for dirpath, _dirs, files in os.walk(winpath(root)):
+        for name in files:
+            p = os.path.join(dirpath, name)
+            try:
+                if 40 <= os.path.getsize(p) <= cap_bytes:
+                    yield p
+            except OSError:
+                continue
+
+
 def cmd_xcheck(cfg: Config, args) -> int:
-    """Completeness proof: every instance referenced by Orthanc's metadata
-    attachments must exist in the scanned inventory.  Run AFTER scans finish."""
+    """Completeness proof: every instance referenced by a metadata store (Orthanc
+    gzip attachments OR dcm4che DICOMweb-JSON exports) must exist in the scanned
+    inventory.  Run AFTER scans finish.  --dir cross-checks a raw directory tree
+    (e.g. a metadata-only store not configured as a source)."""
     conn = db_connect(cfg.general.db_path)
     ensure_indexes(conn)
-    sources = args.source or [s.name for s in cfg.sources]
-    qmarks = ",".join("?" * len(sources))
-    rows = conn.execute(
-        f"SELECT r.path AS root, f.rel_path AS rel FROM files f JOIN roots r USING(root_id) "
-        f"WHERE r.source IN ({qmarks}) AND f.scan_status=? AND f.size BETWEEN 40 AND ?",
-        (*sources, FS_NONDICOM, 32 << 20)).fetchall()
-    log.info("xcheck: decoding up to %d candidate metadata attachments...", len(rows))
+    if args.dir:
+        paths = list(_walk_metadata_dir(args.dir))
+        log.info("xcheck: scanning %d files under %s", len(paths), args.dir)
+    else:
+        sources = args.source or [s.name for s in cfg.sources]
+        qmarks = ",".join("?" * len(sources))
+        rows = conn.execute(
+            f"SELECT r.path AS root, f.rel_path AS rel FROM files f JOIN roots r USING(root_id) "
+            f"WHERE r.source IN ({qmarks}) AND f.scan_status=? AND f.size BETWEEN 40 AND ?",
+            (*sources, FS_NONDICOM, 32 << 20)).fetchall()
+        paths = [os.path.join(r["root"], r["rel"]) for r in rows]
+    log.info("xcheck: decoding up to %d candidate metadata files...", len(paths))
     manifest: dict[str, dict] = {}
     parsed = 0
-    for i, row in enumerate(rows, 1):
-        path = os.path.join(row["root"], row["rel"])
+    for i, path in enumerate(paths, 1):
         entries = _decode_manifest(path)
         if entries is None:
             continue
@@ -4178,7 +4205,7 @@ def cmd_xcheck(cfg: Config, args) -> int:
                 }
         if i % 20000 == 0:
             log.info("xcheck: %d/%d files, %d manifests, %d instances referenced",
-                     i, len(rows), parsed, len(manifest))
+                     i, len(paths), parsed, len(manifest))
     log.info("xcheck: %d manifests decoded, %d distinct instances referenced",
              parsed, len(manifest))
     if not manifest:
@@ -4202,9 +4229,10 @@ def cmd_xcheck(cfg: Config, args) -> int:
                 info = manifest[sop]
                 w.writerow([sop, info["study_uid"], info["pid"], info["name"],
                             info["date"], info["manifest"]])
-        log.warning("xcheck: %d instances referenced by Orthanc are MISSING from the "
-                    "inventory — see the CSV in %s. These lived in folders not covered "
-                    "by any [[source]] root (or were deleted).", len(missing), outdir)
+        log.warning("xcheck: %d instances referenced by the metadata store are MISSING "
+                    "from the scanned inventory — see the CSV in %s. Their pixel files were "
+                    "never scanned (folder not covered by a [[source]] root) or are gone.",
+                    len(missing), outdir)
     log.info("xcheck: %d/%d referenced instances present in the scanned inventory (%.2f%%)",
              found, len(manifest), 100.0 * found / len(manifest))
     conn.close()
@@ -4703,6 +4731,7 @@ max_readers = 2
 [source.fuji]
 enabled = true
 sites = ["8K", "9K"]
+fallback_site = "XK"
 [source.fuji.folder_site_map]
 'site_b' = "9K"
 """
@@ -4801,7 +4830,8 @@ def cmd_selftest(_cfg, args) -> int:
         probs = {r[0]: r[1] for r in conn.execute(
             "SELECT code, COUNT(*) FROM problems WHERE resolved=0 GROUP BY code")}
         check(probs.get(H_DUP_CONFLICT) == 1, f"1 dup conflict (got {probs.get(H_DUP_CONFLICT)})")
-        check(probs.get(H_PID_RULE_MISS) == 1, f"1 fuji site miss (got {probs.get(H_PID_RULE_MISS)})")
+        check(probs.get(H_PID_RULE_MISS, 0) == 0,
+              f"fuji fallback XK cleared site misses (got {probs.get(H_PID_RULE_MISS)})")
         check(probs.get(H_TRUNCATED, 0) + probs.get(H_UNREADABLE, 0) == 2,
               "2 hard unreadable/truncated")
         check(probs.get(H_PIXELLESS_ONLY, 0) == 0,
@@ -4816,6 +4846,8 @@ def cmd_selftest(_cfg, args) -> int:
         for stu_sop, want in exp["fuji"].items():
             got = fuji_map.get(stu_sop.rsplit(".", 1)[0])
             check(got == want, f"fuji pid {stu_sop.rsplit('.', 1)[0]} -> {want} (got {got})")
+        check(fuji_map.get(exp["fuji_nosite_study"]) == "XK319001",
+              f"fuji fallback XK id (got {fuji_map.get(exp['fuji_nosite_study'])})")
         vx_new = conn.execute("SELECT pid_new FROM studies WHERE study_uid='1.2.3.500'").fetchone()[0]
         check(vx_new == "VX00123", f"vxvue pid rule (got {vx_new})")
         det = conn.execute("SELECT detected_codec FROM instances WHERE sop_uid=?",
@@ -4843,7 +4875,7 @@ def cmd_selftest(_cfg, args) -> int:
         check(n_fail == 0, f"no permanent failures (got {n_fail})")
         n_sent = conn.execute("SELECT COUNT(*) FROM instances WHERE send_status IN (?,?)",
                               (S_SENT, S_SENT_WARN)).fetchone()[0]
-        check(n_sent == 17, f"17 instances sent (got {n_sent})")
+        check(n_sent == 18, f"18 instances sent (got {n_sent})")
         conn.close()
 
         # ---- inspect received objects ----
@@ -5002,10 +5034,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sample", type=int, default=300, help="how many conflict groups to sample")
 
     sp = sub.add_parser("xcheck-orthanc",
-                        help="verify every instance referenced by Orthanc metadata "
-                             "attachments exists in the inventory (run AFTER scans)")
+                        help="verify every instance referenced by a metadata store "
+                             "(Orthanc gzip OR DICOMweb-JSON) exists in the inventory")
     sp.add_argument("--source", nargs="*", help="sources holding attachment stores "
                                                 "(default: all)")
+    sp.add_argument("--dir", default=None,
+                    help="cross-check a raw directory tree of metadata files "
+                         "(e.g. a metadata-only store not configured as a source)")
 
     sub.add_parser("status", help="one-screen progress summary")
     sub.add_parser("export-mapping", help="CSV exports of ID/UID mappings")
