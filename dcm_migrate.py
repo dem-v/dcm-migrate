@@ -178,6 +178,7 @@ H_UNREADABLE = "H-UNREADABLE"
 H_TRUNCATED = "H-TRUNCATED"
 H_DUP_CONFLICT = "H-DUP-CONFLICT"
 H_PID_RULE_MISS = "H-PID-RULE-MISS"
+H_PID_COLLISION = "H-PID-COLLISION"   # two studies assigned the same study-level ID
 H_PIXELLESS_ONLY = "H-PIXELLESS-ONLY"
 H_NO_IDENTITY = "H-NO-PATIENT-IDENTITY"
 H_FUJI_NO_DATE = "H-FUJI-NO-DATE"
@@ -640,7 +641,10 @@ pid_rules_mode = "required"      # every study MUST get a generated ID
 enabled = true                   # study-level ID: {site}{M}{YY}{###}
 sites = ["8K", "9K"]             # looked for as substrings of InstitutionName
 fallback_site = "XK"             # mixed/legacy studies with no clear site -> XK marker
-                                 # ("" would make them H-PID-RULE-MISS blockers instead)
+                                 # ("" would make them H-PID-RULE-MISS blockers instead).
+                                 # fallback IDs use a 2-digit month (XK0122...) — the
+                                 # pooled fallback exceeds 999 studies/month and the
+                                 # no-leading-zero form collides (Dec-21#1 == Jan-22#1001)
 date_from_mtime = true           # no/invalid StudyDate: use the file's mtime for the ID
                                  # date (W-FUJI-MTIME-DATE) instead of H-FUJI-NO-DATE
 # Files without a site flag in InstitutionName get their site from the folder
@@ -1680,12 +1684,17 @@ def fuji_site_for(src: SourceCfg, institution: str, abs_path: str) -> str | None
     return None
 
 
-def fuji_pid(site: str, study_date: str, ordinal: int) -> str:
+def fuji_pid(site: str, study_date: str, ordinal: int, two_digit_month: bool = False) -> str:
     """{site}{M}{YY}{###} — M is 1..12 without leading zero, YY 2-digit year,
-    ### per-month ordinal (grows past 999 naturally)."""
+    ### per-month ordinal (grows past 999 naturally).
+
+    two_digit_month zero-pads M (used for the fallback site): the historical
+    no-leading-zero format is ambiguous once a month exceeds 999 studies —
+    Dec-2021 #1 (12+21+001) == Jan-2022 #1001 (1+22+1001) == "XK1221001"."""
     yy = study_date[2:4]
     month = int(study_date[4:6])
-    return f"{site}{month}{yy}{ordinal:03d}"
+    m = f"{month:02d}" if two_digit_month else str(month)
+    return f"{site}{m}{yy}{ordinal:03d}"
 
 
 def placeholder_pid(institution: str, study_date: str, study_time: str) -> str:
@@ -2693,10 +2702,26 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
                     (date, row["study_time"], row["study_uid"], pk))
             for (site, _ym), lst in groups.items():
                 lst.sort()
+                # fallback-site pool spans many institutions -> months exceed 999
+                # studies; only the fixed-width (zero-padded month) form is
+                # collision-free there.  8K/9K keep the historical format.
+                two_dig = bool(src.fuji.fallback_site) and site == src.fuji.fallback_site
                 for ordinal, (date, _t, _uid, pk) in enumerate(lst, start=1):
                     conn.execute("UPDATE studies SET pid_new=?, pid_rule=? WHERE study_pk=?",
-                                 (fuji_pid(site, date, ordinal), f"fuji:{site}", pk))
+                                 (fuji_pid(site, date, ordinal, two_dig), f"fuji:{site}", pk))
                     n_rewritten += 1
+            # study-level IDs MUST be unique: any duplicate blocks the gate
+            for pid_new, n_dup, uids in conn.execute(
+                    "SELECT pid_new, COUNT(*), GROUP_CONCAT(study_uid) FROM studies "
+                    "WHERE source=? AND pid_new IS NOT NULL AND pid_rule LIKE 'fuji:%' "
+                    "GROUP BY pid_new HAVING COUNT(*)>1", (src.name,)):
+                conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
+                             "VALUES(?,?,?,?,?,?)",
+                             (run, SEV_HARD, H_PID_COLLISION, "aggregate", None,
+                              json.dumps({"source": src.name, "pid_new": pid_new,
+                                          "studies": n_dup,
+                                          "study_uids": uids.split(",")[:10]},
+                                         ensure_ascii=False)))
             if mtime_dated:
                 conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
                              "VALUES(?,?,?,?,?,?)",
@@ -2860,7 +2885,7 @@ def _report_pid_preview(conn, outdir: Path) -> int:
                 "FROM studies s LEFT JOIN patients p USING(patient_pk) "
                 "WHERE s.pid_new IS NOT NULL ORDER BY s.source, s.pid_new"):
             w.writerow([row["source"], row["station"], display_text(row["institution"]),
-                        row["pid"], row["pid_rule"], row["pid_new"],
+                        display_text(row["pid"]), row["pid_rule"], row["pid_new"],
                         display_text(row["name"]), row["name"], row["study_date"],
                         row["study_uid"], row["n_instances"]])
             n += 1
@@ -4828,6 +4853,11 @@ def _selftest_units(check) -> None:
     check(codec == "utf-8", f"detect utf-8 (got {codec})")
     check(fuji_pid("8K", "20190301", 1) == "8K319001", "fuji pid format")
     check(fuji_pid("9K", "20191115", 23) == "9K1119023", "fuji pid Nov")
+    check(fuji_pid("XK", "20190301", 1, two_digit_month=True) == "XK0319001",
+          "fuji pid 2-digit month")
+    check(fuji_pid("XK", "20211201", 1, two_digit_month=True)
+          != fuji_pid("XK", "20220112", 1001, two_digit_month=True),
+          "fuji pid ambiguity resolved (Dec-21#1 vs Jan-22#1001)")
     src = SourceCfg(name="t", roots=["x"], patient_id_rules=[
         PidRule(id="r", match=r"^VX-(?P<n>\d+)$", template="VX{n}")])
     check(apply_pid_rules(src, "VX-007", "", "") == ("VX007", "r"), "pid rule")
@@ -4913,7 +4943,7 @@ def cmd_selftest(_cfg, args) -> int:
         for stu_sop, want in exp["fuji"].items():
             got = fuji_map.get(stu_sop.rsplit(".", 1)[0])
             check(got == want, f"fuji pid {stu_sop.rsplit('.', 1)[0]} -> {want} (got {got})")
-        check(fuji_map.get(exp["fuji_nosite_study"]) == "XK319001",
+        check(fuji_map.get(exp["fuji_nosite_study"]) == "XK0319001",
               f"fuji fallback XK id (got {fuji_map.get(exp['fuji_nosite_study'])})")
         vx_new = conn.execute("SELECT pid_new FROM studies WHERE study_uid='1.2.3.500'").fetchone()[0]
         check(vx_new == "VX00123", f"vxvue pid rule (got {vx_new})")
