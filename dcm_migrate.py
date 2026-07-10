@@ -193,6 +193,7 @@ W_DUP_REGEN = "W-DUP-COLLISION-REGEN"      # same-UID/diff-pixels kept via new U
 W_DUP_DROPPED = "W-DUP-COLLISION-DROPPED"  # same-UID/diff-pixels, losers discarded
 W_PID_REWRITE = "W-PID-REWRITE"
 W_IDENTITY_PLACEHOLDER = "W-IDENTITY-PLACEHOLDER"
+W_FUJI_MTIME_DATE = "W-FUJI-MTIME-DATE"   # ID date derived from file mtime
 W_KEEPGB = "W-GB-DECLARATION-FIXED"
 I_NONDICOM = "I-NON-DICOM"
 
@@ -301,6 +302,9 @@ class FujiCfg:
     # site code for studies that match neither InstitutionName flag nor folder map
     # (mixed/legacy sources).  "" => such studies become H-PID-RULE-MISS blockers.
     fallback_site: str = ""
+    # studies with no/invalid StudyDate: derive the ID date from file mtime
+    # (W-FUJI-MTIME-DATE) instead of blocking with H-FUJI-NO-DATE
+    date_from_mtime: bool = True
 
 
 @dataclass
@@ -637,6 +641,8 @@ enabled = true                   # study-level ID: {site}{M}{YY}{###}
 sites = ["8K", "9K"]             # looked for as substrings of InstitutionName
 fallback_site = "XK"             # mixed/legacy studies with no clear site -> XK marker
                                  # ("" would make them H-PID-RULE-MISS blockers instead)
+date_from_mtime = true           # no/invalid StudyDate: use the file's mtime for the ID
+                                 # date (W-FUJI-MTIME-DATE) instead of H-FUJI-NO-DATE
 # Files without a site flag in InstitutionName get their site from the folder
 # they came from (case-insensitive substring match on the absolute path):
 [source.fuji.folder_site_map]
@@ -2522,9 +2528,15 @@ def _an_dedupe(conn, cfg: Config, run: int) -> None:
         for r, ph, ts in good:
             by_ts.setdefault(ts, set()).add(ph)
         danger = any(len(hh) > 1 for hh in by_ts.values())
+        # pixel-less IODs (PR/SR/…): no PixelData to compare, but tier 1 already
+        # proved the bytes differ -> a content collision, resolved by the same policy
+        nopix_diff = (not good and bool(pinfo)
+                      and all(ph == "no-pixeldata" for (_r, ph, _t) in pinfo))
 
-        if danger:
-            detail = {"sop_uid": sop_uid, "policy": policy, "candidates": [
+        if danger or nopix_diff:
+            detail = {"sop_uid": sop_uid, "policy": policy,
+                      "kind": "pixel-diff" if danger else "no-pixel-iod-diff",
+                      "candidates": [
                 {"source": r["source"], "path": _abs_path(conn, r["file_id"]),
                  "size": r["size"], "instance_id": r["instance_id"],
                  "ts": ts, "pixel_hash": ph[:12]} for (r, ph, ts) in pinfo]}
@@ -2645,10 +2657,12 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
         n_rewritten = 0
         if src.fuji.enabled:
             groups: dict[tuple[str, str], list] = {}
+            mtime_dated: list[tuple[str, str]] = []
             for pk, row in rows.items():
                 inst = conn.execute(
-                    "SELECT file_id FROM instances WHERE study_pk=? AND canonical=1 "
-                    "ORDER BY instance_id LIMIT 1", (pk,)).fetchone()
+                    "SELECT i.file_id, f.mtime_ns FROM instances i JOIN files f USING(file_id) "
+                    "WHERE i.study_pk=? AND i.canonical=1 "
+                    "ORDER BY i.instance_id LIMIT 1", (pk,)).fetchone()
                 path = _abs_path(conn, inst["file_id"]) if inst else ""
                 site = fuji_site_for(src, row["institution"], path)
                 if site is None:
@@ -2664,12 +2678,17 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
                     continue
                 date = row["study_date"]
                 if not re.fullmatch(r"\d{8}", date or ""):
-                    conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
-                                 "VALUES(?,?,?,?,?,?)",
-                                 (run, SEV_HARD, H_FUJI_NO_DATE, "study", pk,
-                                  json.dumps({"source": src.name, "study_uid": row["study_uid"],
-                                              "study_date": date}, ensure_ascii=False)))
-                    continue
+                    if src.fuji.date_from_mtime and inst and inst["mtime_ns"]:
+                        date = time.strftime("%Y%m%d", time.localtime(inst["mtime_ns"] / 1e9))
+                        mtime_dated.append((row["study_uid"], date))
+                    else:
+                        conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
+                                     "VALUES(?,?,?,?,?,?)",
+                                     (run, SEV_HARD, H_FUJI_NO_DATE, "study", pk,
+                                      json.dumps({"source": src.name, "study_uid": row["study_uid"],
+                                                  "study_date": row["study_date"]},
+                                                 ensure_ascii=False)))
+                        continue
                 groups.setdefault((site, date[:6]), []).append(
                     (date, row["study_time"], row["study_uid"], pk))
             for (site, _ym), lst in groups.items():
@@ -2678,6 +2697,12 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
                     conn.execute("UPDATE studies SET pid_new=?, pid_rule=? WHERE study_pk=?",
                                  (fuji_pid(site, date, ordinal), f"fuji:{site}", pk))
                     n_rewritten += 1
+            if mtime_dated:
+                conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
+                             "VALUES(?,?,?,?,?,?)",
+                             (run, SEV_WARN, W_FUJI_MTIME_DATE, "aggregate", None,
+                              json.dumps({"source": src.name, "studies": len(mtime_dated),
+                                          "sample": mtime_dated[:20]}, ensure_ascii=False)))
         else:
             for pk, row in rows.items():
                 new, rid = apply_pid_rules(src, row["pid"], row["station"], row["institution"])
@@ -2803,11 +2828,29 @@ def _csv_writer(path: Path, header: list[str]):
     return f, w
 
 
+def display_text(raw: str) -> str:
+    """Best-effort human rendering of a latin-1-preserved raw DB string, for the
+    review CSVs only (the send path uses per-instance codec detection instead)."""
+    if not raw or raw.isascii():
+        return raw
+    try:
+        b = raw.encode("latin-1")
+    except UnicodeEncodeError:
+        return raw  # not a byte-preserving string — already real text
+    codec, score = detect_codec(b, ["utf-8", "cp1251", "gb18030"])
+    if codec and codec != "ascii" and score >= 0.5:
+        try:
+            return b.decode(codec)
+        except (UnicodeDecodeError, ValueError):
+            pass
+    return raw
+
+
 def _report_pid_preview(conn, outdir: Path) -> int:
     f, w = _csv_writer(outdir / "patient_id_preview.csv",
                        ["source", "station", "institution", "old_patient_id", "rule",
-                        "new_patient_id", "patient_name_raw", "study_date", "study_uid",
-                        "n_instances"])
+                        "new_patient_id", "patient_name", "patient_name_raw",
+                        "study_date", "study_uid", "n_instances"])
     n = 0
     with f:
         for row in conn.execute(
@@ -2816,8 +2859,9 @@ def _report_pid_preview(conn, outdir: Path) -> int:
                 " s.study_uid, s.n_instances "
                 "FROM studies s LEFT JOIN patients p USING(patient_pk) "
                 "WHERE s.pid_new IS NOT NULL ORDER BY s.source, s.pid_new"):
-            w.writerow([row["source"], row["station"], row["institution"], row["pid"],
-                        row["pid_rule"], row["pid_new"], row["name"], row["study_date"],
+            w.writerow([row["source"], row["station"], display_text(row["institution"]),
+                        row["pid"], row["pid_rule"], row["pid_new"],
+                        display_text(row["name"]), row["name"], row["study_date"],
                         row["study_uid"], row["n_instances"]])
             n += 1
     return n
@@ -2870,7 +2914,7 @@ def _report_clusters(conn, cfg: Config, outdir: Path) -> None:
     if not fuji_sources:
         return
     f, w = _csv_writer(outdir / "patient_clusters.csv",
-                       ["cluster", "birth_date", "name_raw", "old_patient_id",
+                       ["cluster", "birth_date", "name", "old_patient_id",
                         "new_patient_id", "study_date", "study_uid"])
     qmarks = ",".join("?" * len(fuji_sources))
     clusters: dict[tuple[str, str], list] = {}
@@ -2879,7 +2923,7 @@ def _report_clusters(conn, cfg: Config, outdir: Path) -> None:
             f" COALESCE(p.name_raw,'') name, COALESCE(p.birth_date,'') birth "
             f"FROM studies s LEFT JOIN patients p USING(patient_pk) "
             f"WHERE s.source IN ({qmarks}) AND s.n_instances>0", fuji_sources):
-        key = (row["birth"], _norm_name_for_cluster(row["name"]))
+        key = (row["birth"], _norm_name_for_cluster(display_text(row["name"])))
         if key[1]:
             clusters.setdefault(key, []).append(row)
     with f:
@@ -2889,7 +2933,7 @@ def _report_clusters(conn, cfg: Config, outdir: Path) -> None:
                 continue
             cid += 1
             for r in rows:
-                w.writerow([cid, key[0], r["name"], r["pid"], r["pid_new"],
+                w.writerow([cid, key[0], display_text(r["name"]), r["pid"], r["pid_new"],
                             r["study_date"], r["study_uid"]])
 
 
@@ -3060,6 +3104,16 @@ def cmd_exclude(cfg: Config, args) -> int:
             n += _apply_exclusion(conn, "file", args.file_id)
             conn.execute("UPDATE problems SET resolved=1 WHERE scope='file' AND ref=?",
                          (args.file_id,))
+        if args.path_glob:
+            pat = args.path_glob.lower()
+            hits = [fid for fid, root, rel in conn.execute(
+                        "SELECT f.file_id, r.path, f.rel_path FROM files f "
+                        "JOIN roots r USING(root_id) WHERE f.scan_status!=?", (FS_EXCLUDED,))
+                    if fnmatch.fnmatch(os.path.join(root, rel).lower(), pat)
+                    or fnmatch.fnmatch(os.path.basename(rel).lower(), pat)]
+            for fid in hits:
+                n += _apply_exclusion(conn, "file", fid)
+            log.info("path-glob %r matched %d files", args.path_glob, len(hits))
         conn.execute(
             "UPDATE studies SET n_instances = (SELECT COUNT(*) FROM instances i "
             "WHERE i.study_pk = studies.study_pk AND i.canonical=1 AND i.send_status NOT IN (?,?))",
@@ -4312,7 +4366,8 @@ def cmd_dup_audit(cfg: Config, args) -> int:
         cross = "cross-root" if len(roots) > 1 else "same-root"
         hashes = {h for h in phs if re.fullmatch(r"[0-9a-f]{64}", h or "")}
         if reasons and not hashes:
-            cat = f"{cross}/uncheckable"
+            why = "/".join(sorted({r.split(":")[0] for r in reasons})[:2])
+            cat = f"{cross}/uncheckable({why})"
         elif len(tss) > 1 and len(hashes) > 1:
             cat = f"{cross}/diff-TS(pixels-not-comparable)"
         elif len(hashes) == 1 and len(phs) == 1:
@@ -4604,6 +4659,14 @@ def build_selftest_tree(root: Path) -> dict:
     dup_diff_b.PixelData = bytes(reversed(range(64)))
     _write(dup_diff_b, vx / "v2_copy.dcm")
     exp["dup_diff_sop"] = "1.2.3.600.1"
+    # same UID, different bytes, NO pixels (PR): the no-pixel-iod-diff collision path
+    for label, fname in (("STATE_A", "pr_a.dcm"), ("STATE_B", "pr_b.dcm")):
+        prd = _mk_ds("1.2.840.10008.5.1.4.1.1.11.1", "1.2.3.960.1", "1.2.3.960",
+                     "1.2.3.960.9", "PR", "VX-00960", "Dup^State")
+        del prd.PixelData
+        prd.ContentLabel = label
+        _write(prd, vx / fname)
+    exp["dup_nopix_sop"] = "1.2.3.960.1"
     badu = _mk_ds(CR_SOP, "1.2.3.700.01", "1.2.3.700", "1.2.3.700.9", "DX",
                   "VX-00125", "Bad^Uid")  # leading zero component = invalid
     _write(badu, vx / "v3.dcm")
@@ -4744,7 +4807,7 @@ class _Args:
         defaults = dict(source=None, rescan="new", limit=0, force_threads=True,
                         study_uid=None, dry_run=False, dry_run_dir=None,
                         ignore_window=True, single_aet=None, ack=None, note=None,
-                        arm=False, problem=None, file_id=None,
+                        arm=False, problem=None, file_id=None, path_glob=None,
                         resolve_dup_priority=False, fallback_ledger=False,
                         host=None, port=None, called_aet=None, calling_aet=None)
         defaults.update(kw)
@@ -4810,7 +4873,7 @@ def cmd_selftest(_cfg, args) -> int:
         cmd_scan(cfg, _Args())
         conn = db_connect(cfg.general.db_path)
         n_inst = conn.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
-        check(n_inst == 20, f"scan found 20 instances (got {n_inst})")
+        check(n_inst == 22, f"scan found 22 instances (got {n_inst})")
         n_nd = conn.execute("SELECT COUNT(*) FROM files WHERE scan_status=?",
                             (FS_NONDICOM,)).fetchone()[0]
         check(n_nd == 3, f"3 non-dicom (2 decoys + 1 DICOMDIR) (got {n_nd})")
@@ -4829,7 +4892,11 @@ def cmd_selftest(_cfg, args) -> int:
         conn = db_connect(cfg.general.db_path)
         probs = {r[0]: r[1] for r in conn.execute(
             "SELECT code, COUNT(*) FROM problems WHERE resolved=0 GROUP BY code")}
-        check(probs.get(H_DUP_CONFLICT) == 1, f"1 dup conflict (got {probs.get(H_DUP_CONFLICT)})")
+        check(probs.get(H_DUP_CONFLICT) == 2, f"2 dup conflicts (got {probs.get(H_DUP_CONFLICT)})")
+        kinds_dup = {json.loads(r[0]).get("kind") for r in conn.execute(
+            "SELECT detail FROM problems WHERE code=? AND resolved=0", (H_DUP_CONFLICT,))}
+        check(kinds_dup == {"pixel-diff", "no-pixel-iod-diff"},
+              f"dup-conflict kinds classified (got {kinds_dup})")
         check(probs.get(H_PID_RULE_MISS, 0) == 0,
               f"fuji fallback XK cleared site misses (got {probs.get(H_PID_RULE_MISS)})")
         check(probs.get(H_TRUNCATED, 0) + probs.get(H_UNREADABLE, 0) == 2,
@@ -4859,6 +4926,7 @@ def cmd_selftest(_cfg, args) -> int:
         cmd_exclude(cfg, _Args(problem=H_PID_RULE_MISS))
         cmd_exclude(cfg, _Args(problem=H_TRUNCATED))
         cmd_exclude(cfg, _Args(problem=H_UNREADABLE))
+        cmd_exclude(cfg, _Args(path_glob="*.no-such-suffix"))  # exercise, matches nothing
         conn = db_connect(cfg.general.db_path)
         ok, issues = gate_status(conn, cfg)
         warn_codes = [i.split()[1] for i in issues if i.startswith("warning ")]
@@ -4875,7 +4943,7 @@ def cmd_selftest(_cfg, args) -> int:
         check(n_fail == 0, f"no permanent failures (got {n_fail})")
         n_sent = conn.execute("SELECT COUNT(*) FROM instances WHERE send_status IN (?,?)",
                               (S_SENT, S_SENT_WARN)).fetchone()[0]
-        check(n_sent == 18, f"18 instances sent (got {n_sent})")
+        check(n_sent == 19, f"19 instances sent (got {n_sent})")
         conn.close()
 
         # ---- inspect received objects ----
@@ -4919,6 +4987,8 @@ def cmd_selftest(_cfg, args) -> int:
         check(exp["bare_sop"] in rx and exp["zlib_sop"] in rx,
               "preambleless + zlib blobs delivered")
         check(exp["pr_sop"] in rx, "Presentation State (no pixels) was sent, not blocked")
+        check(len([s for s in scp.stored_sops if s == exp["dup_nopix_sop"]]) == 1,
+              "no-pixel dup collision resolved to exactly one sent copy")
 
         rc = cmd_verify(cfg, _Args())
         check(rc == 0, "verify all MATCH")
@@ -4991,6 +5061,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("exclude", help="exclude files/studies or resolve problem classes")
     sp.add_argument("--problem", help="resolve+exclude everything flagged with this code")
     sp.add_argument("--study-uid", help="exclude one study")
+    sp.add_argument("--path-glob", help="exclude files whose path matches this glob "
+                                        "(e.g. \"*.tmp\"); case-insensitive, matched against "
+                                        "the full path and the basename")
     sp.add_argument("--file-id", type=int, help="exclude one file by id (see problems.csv)")
     sp.add_argument("--resolve-dup-priority", action="store_true",
                     help="resolve every H-DUP-CONFLICT by source priority")
