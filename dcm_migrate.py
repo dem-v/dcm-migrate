@@ -3717,12 +3717,15 @@ class Sender(threading.Thread):
             self.membudget.release(size)
 
 def cmd_send(cfg: Config, args) -> int:
+    t0 = time.monotonic()
+    log.info("send: opening state DB %s", cfg.general.db_path)
     conn = db_connect(cfg.general.db_path)
     ensure_indexes(conn)
     if args.dry_run:
         log.info("DRY RUN: sending to an in-process loopback SCP — gate not required")
     else:
         check_armed(conn, cfg)
+        log.info("send: gate check passed")
 
     with conn:  # reclaim stale claims from crashed runs
         conn.execute("UPDATE studies SET claimed_by=NULL WHERE claimed_by IS NOT NULL")
@@ -3742,19 +3745,24 @@ def cmd_send(cfg: Config, args) -> int:
             conn.execute("UPDATE studies SET claimed_by='~excluded-by-filter' WHERE study_pk!=?",
                          (row["study_pk"],))
 
+    log.info("send: planning lanes — one pass over the instance inventory "
+             "(takes minutes on a multi-10M-row DB, no output until done)")
     lanes_rows = conn.execute(
-        "SELECT DISTINCT i.source, s.dest_group FROM instances i "
+        "SELECT i.source, s.dest_group, COUNT(*) AS n FROM instances i "
         "JOIN studies s ON s.study_pk=i.study_pk "
         f"WHERE i.canonical=1 AND i.send_status IN (?,?){where_src} "
-        "AND s.dest_group IS NOT NULL", params).fetchall()
+        "AND s.dest_group IS NOT NULL GROUP BY i.source, s.dest_group", params).fetchall()
     if not lanes_rows:
         log.info("nothing to send")
         return 0
-    pending_n = conn.execute(
-        f"SELECT COUNT(*) FROM instances i WHERE i.canonical=1 AND i.send_status IN (?,?){where_src}",
-        params).fetchone()[0]
-    log.info("send: %d pending instances across %d lane(s)", pending_n, len(lanes_rows))
+    pending_n = sum(r["n"] for r in lanes_rows)
+    log.info("send: %s pending instances across %d lane(s), planned in %s",
+             f"{pending_n:,}", len(lanes_rows), fmt_dur(time.monotonic() - t0))
+    for r in lanes_rows:
+        log.info("  lane %-12s -> %-5s : %s pending", r["source"], r["dest_group"],
+                 f"{r['n']:,}")
 
+    log.info("send: loading UID remap + interner tables")
     uid_remap = {(r["old_uid"], r["uid_type"]): r["new_uid"]
                  for r in conn.execute("SELECT old_uid, uid_type, new_uid FROM uid_remap")}
     sop_rev = Interner("sop_classes").reverse(conn)
@@ -3963,6 +3971,8 @@ def cmd_status(cfg: Config, args) -> int:
     print(f"gate: {meta_get(conn, 'gate', 'never armed')}")
     print(f"analyze run: {meta_get(conn, 'analyze_run', '-')}")
     print()
+    log.info("status: counting per-source instance states (full pass over the "
+             "inventory — minutes on a multi-10M-row DB)")
     print(f"{'source':<14}{'pending':>10}{'sent':>10}{'warn':>8}{'failed':>8}"
           f"{'skipped':>9}{'excluded':>9}{'bytes pending':>16}")
     for src in cfg.sources:
