@@ -418,7 +418,14 @@ def load_config(path: str) -> Config:
     errors: list[str] = []
     cfg = Config()
     cfg.config_path = str(p.resolve())
-    cfg.config_hash = hashlib.sha256(raw_bytes).hexdigest()
+    # The gate hash covers CONTENT-affecting config only: [network] holds runtime
+    # tuning (max_associations, rate cap, active hours, …) that must be adjustable
+    # mid-send without invalidating an approved analyze.  Hash the parsed form so
+    # comment/whitespace edits don't disarm anything either.
+    hash_data = {k: v for k, v in data.items() if k != "network"}
+    cfg.config_hash = hashlib.sha256(
+        json.dumps(hash_data, sort_keys=True, ensure_ascii=False,
+                   default=str).encode("utf-8")).hexdigest()
 
     cfg.general = _dc_from_dict(GeneralCfg, data.get("general", {}), "[general]", errors)
 
@@ -556,6 +563,8 @@ xa   = ["XA", "RF"]
 precedence = ["ct", "xa", "xray", "other"]
 
 [network]
+# runtime tuning only — this section is EXCLUDED from the approval gate hash,
+# so it can be adjusted between (or during) send sessions without re-analyzing
 max_associations = 3            # concurrent associations (sender threads)
 rate_limit_mbit = 350           # bandwidth cap; 0 = unlimited (link is shared!)
 active_hours = "20:00-07:00"    # local time window; "" = around the clock
@@ -1070,25 +1079,42 @@ class DbWriter(threading.Thread):
                         break
                     continue
                 kind = item[0]
-                try:
-                    if kind == "exec":
-                        conn.execute(item[1], item[2])
-                        pending += 1
-                    elif kind == "many":
-                        conn.executemany(item[1], item[2])
-                        pending += len(item[2])
-                    elif kind == "func":
-                        item[1](conn)
-                        pending += 1
-                    elif kind == "flush":
-                        conn.commit()
-                        pending, last_commit = 0, time.monotonic()
-                        item[1].set()
-                except BaseException as e:  # surface, don't die silently
-                    self.error = e
-                    log.exception("db-writer error on %s", kind)
-                    if kind == "flush":
-                        item[1].set()
+                # a dropped item is lost bookkeeping (a sent instance would be
+                # re-sent next run) — retry lock contention, never swallow it
+                for attempt in range(8):
+                    try:
+                        if kind == "exec":
+                            conn.execute(item[1], item[2])
+                            pending += 1
+                        elif kind == "many":
+                            conn.executemany(item[1], item[2])
+                            pending += len(item[2])
+                        elif kind == "func":
+                            item[1](conn)
+                            pending += 1
+                        elif kind == "flush":
+                            conn.commit()
+                            pending, last_commit = 0, time.monotonic()
+                            item[1].set()
+                        break
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e).lower() and attempt < 7:
+                            if attempt == 0:
+                                log.warning("db-writer: database locked on %s — retrying", kind)
+                            time.sleep(1 + attempt)
+                            continue
+                        self.error = e
+                        log.exception("db-writer error on %s (giving up after %d tries)",
+                                      kind, attempt + 1)
+                        if kind == "flush":
+                            item[1].set()
+                        break
+                    except BaseException as e:  # surface, don't die silently
+                        self.error = e
+                        log.exception("db-writer error on %s", kind)
+                        if kind == "flush":
+                            item[1].set()
+                        break
                 if pending >= self.BATCH_COMMIT_ROWS:
                     conn.commit()
                     pending, last_commit = 0, time.monotonic()
@@ -3409,22 +3435,29 @@ class Sender(threading.Thread):
     # ---- claiming ----------------------------------------------------------
     def claim_studies(self, lane: Lane) -> list[sqlite3.Row]:
         me = self.name
-        with self.conn:  # BEGIN..COMMIT
-            self.conn.execute("BEGIN IMMEDIATE")
-            rows = self.conn.execute(
-                "SELECT DISTINCT s.study_pk, s.study_uid, s.dest_group, s.pid_new, s.study_date,"
-                " s.accession, s.n_instances "
-                "FROM studies s JOIN instances i ON i.study_pk=s.study_pk "
-                "WHERE i.source=? AND s.dest_group=? AND s.claimed_by IS NULL "
-                "AND i.canonical=1 AND i.send_status IN (?,?) LIMIT ?",
-                (lane.source, lane.dest_group, S_PENDING, S_FAILED_RETRY,
-                 self.BATCH_STUDIES)).fetchall()
-            if rows:
-                self.conn.executemany(
+        # The candidate SELECT runs OUTSIDE any write transaction: on a 40M-row
+        # inventory it can take seconds, and holding BEGIN IMMEDIATE across it
+        # starves the db-writer ("database is locked" storms).  Claiming is
+        # optimistic instead — the UPDATE re-checks claimed_by IS NULL and the
+        # rowcount decides which studies this sender actually won.
+        cand = self.conn.execute(
+            "SELECT s.study_pk, s.study_uid, s.dest_group, s.pid_new, s.study_date,"
+            " s.accession, s.n_instances "
+            "FROM studies s "
+            "WHERE s.dest_group=? AND s.claimed_by IS NULL "
+            "AND EXISTS (SELECT 1 FROM instances i WHERE i.study_pk=s.study_pk "
+            " AND i.source=? AND i.canonical=1 AND i.send_status IN (?,?)) LIMIT ?",
+            (lane.dest_group, lane.source, S_PENDING, S_FAILED_RETRY,
+             self.BATCH_STUDIES)).fetchall()
+        won = []
+        with self.conn:  # short write txn: a handful of indexed UPDATEs
+            for r in cand:
+                cur = self.conn.execute(
                     "UPDATE studies SET claimed_by=?, claimed_at=? WHERE study_pk=? "
-                    "AND claimed_by IS NULL",
-                    [(me, now_ms(), r["study_pk"]) for r in rows])
-        return rows
+                    "AND claimed_by IS NULL", (me, now_ms(), r["study_pk"]))
+                if cur.rowcount == 1:
+                    won.append(r)
+        return won
 
     def unclaim(self, study_pks: list[int]) -> None:
         if study_pks:
