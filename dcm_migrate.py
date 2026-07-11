@@ -195,6 +195,7 @@ W_DUP_DROPPED = "W-DUP-COLLISION-DROPPED"  # same-UID/diff-pixels, losers discar
 W_PID_REWRITE = "W-PID-REWRITE"
 W_IDENTITY_PLACEHOLDER = "W-IDENTITY-PLACEHOLDER"
 W_FUJI_MTIME_DATE = "W-FUJI-MTIME-DATE"   # ID date derived from file mtime
+W_COMPANION_ROUTED = "W-COMPANION-ROUTED"  # SR/PR/OT/… study rerouted to sibling's archive
 W_KEEPGB = "W-GB-DECLARATION-FIXED"
 I_NONDICOM = "I-NON-DICOM"
 
@@ -268,6 +269,10 @@ class RoutingCfg:
     groups: dict[str, list[str]] = field(default_factory=lambda: {
         "ct": ["CT"], "xray": ["CR", "DX"], "xa": ["XA", "RF"]})
     precedence: list[str] = field(default_factory=lambda: ["ct", "xa", "xray", "other"])
+    # OPT-IN: companion-only studies (dose reports, presentation states, … saved
+    # under their OWN StudyInstanceUID) adopt the destination of a sibling image
+    # study (same accession, else same patient+date).  Default [] = disabled.
+    companion: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -437,12 +442,15 @@ def load_config(path: str) -> Config:
 
     rt = dict(data.get("routing", {}))
     precedence = rt.pop("precedence", None)
+    companion = rt.pop("companion", None)
     groups = {k: v for k, v in rt.items() if isinstance(v, list)}
     cfg.routing = RoutingCfg()
     if groups:
         cfg.routing.groups = {k: [str(x) for x in v] for k, v in groups.items()}
     if precedence:
         cfg.routing.precedence = [str(x) for x in precedence]
+    if companion is not None:
+        cfg.routing.companion = [str(x) for x in companion]
     if "other" not in cfg.routing.precedence:
         cfg.routing.precedence.append("other")
 
@@ -561,6 +569,12 @@ ct   = ["CT"]
 xray = ["CR", "DX"]
 xa   = ["XA", "RF"]
 precedence = ["ct", "xa", "xray", "other"]
+# OPT-IN (disabled by default): studies consisting ONLY of the listed
+# modalities (dose reports, presentation states, … stored under their own
+# StudyInstanceUID) adopt the destination of a sibling image study — matched
+# by AccessionNumber, else patient + StudyDate.  Uncomment to enable; verify
+# your orphan studies actually HAVE siblings first (else this is a no-op).
+#companion = ["SR", "PR", "OT", "SEG", "KO", "REG"]
 
 [network]
 # runtime tuning only — this section is EXCLUDED from the approval gate hash,
@@ -2810,12 +2824,50 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
                       json.dumps({"studies": n_placeholder})))
 
 
-def _an_routing(conn, cfg: Config) -> None:
-    updates = []
-    for row in conn.execute("SELECT study_pk, modalities FROM studies"):
-        group = cfg.group_for_modalities(row["modalities"].split(","))
-        updates.append((group, row["study_pk"]))
-    conn.executemany("UPDATE studies SET dest_group=? WHERE study_pk=?", updates)
+def _an_routing(conn, cfg: Config, run: int) -> None:
+    companion = {m.strip().upper() for m in cfg.routing.companion if m.strip()}
+
+    def sibling_keys(row):
+        keys = []
+        acc = (row["accession"] or "").strip()
+        if len(acc) >= 4:  # short accessions ("1", "-") are junk, not linkage
+            keys.append(("a", acc))
+        if row["patient_pk"] is not None and (row["study_date"] or "").strip():
+            keys.append(("d", row["patient_pk"], row["study_date"]))
+        return keys
+
+    rows = conn.execute("SELECT study_pk, patient_pk, accession, study_date, study_uid,"
+                        " modalities FROM studies").fetchall()
+    group_of: dict[int, str] = {}
+    anchors: dict[tuple, set] = {}
+    orphans = []
+    for row in rows:
+        mods = {m.strip().upper() for m in row["modalities"].split(",") if m.strip()}
+        group_of[row["study_pk"]] = cfg.group_for_modalities(mods)
+        if mods and mods <= companion:
+            orphans.append(row)  # dose report / GSPS / … saved as its own study
+        else:
+            for key in sibling_keys(row):
+                anchors.setdefault(key, set()).add(group_of[row["study_pk"]])
+    adopted = []
+    for row in orphans:
+        cand: set = set()
+        for key in sibling_keys(row):
+            cand |= anchors.get(key, set())
+        for g in cfg.routing.precedence:
+            if g in cand:
+                if g != group_of[row["study_pk"]]:
+                    group_of[row["study_pk"]] = g
+                    adopted.append((row["study_uid"], g))
+                break
+    conn.executemany("UPDATE studies SET dest_group=? WHERE study_pk=?",
+                     [(g, pk) for pk, g in group_of.items()])
+    if adopted:
+        conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) VALUES(?,?,?,?,?,?)",
+                     (run, SEV_WARN, W_COMPANION_ROUTED, "aggregate", None,
+                      json.dumps({"studies": len(adopted), "sample": adopted[:20]},
+                                 ensure_ascii=False)))
+        log.info("routing: %d companion-only studies adopted a sibling's archive", len(adopted))
     conn.execute(
         "UPDATE studies SET n_instances = (SELECT COUNT(*) FROM instances i "
         "WHERE i.study_pk = studies.study_pk AND i.canonical=1 AND i.send_status NOT IN (?,?))",
@@ -2861,7 +2913,7 @@ def cmd_analyze(cfg: Config, args) -> int:
     conn.commit()
     _an_pid_assign(conn, cfg, run)
     conn.commit()
-    _an_routing(conn, cfg)
+    _an_routing(conn, cfg, run)
     _an_aggregate_warnings(conn, cfg, run)
     meta_set(conn, "analyze_run", str(run))
     meta_set(conn, "analyze_config_hash", cfg.config_hash)
@@ -4686,6 +4738,7 @@ def build_selftest_tree(root: Path) -> dict:
     pr.PatientBirthDate = "19800101"
     pr.PatientSex = "O"
     pr.StudyDate = "20200115"
+    pr.AccessionNumber = "ACC1"   # links it to the image fixtures -> companion adoption
     pr.ContentLabel = "ANNOTATION"
     pfm = FileMetaDataset()
     pfm.MediaStorageSOPClassUID = UID("1.2.840.10008.5.1.4.1.1.11.1")
@@ -4811,6 +4864,7 @@ called_aet = "LOOPBACK"
 ct   = ["CT"]
 xray = ["CR", "DX"]
 precedence = ["ct", "xray", "other"]
+companion = ["SR", "PR", "OT", "SEG", "KO", "REG"]
 
 [network]
 max_associations = 2
@@ -5003,6 +5057,9 @@ def cmd_selftest(_cfg, args) -> int:
         det = conn.execute("SELECT detected_codec FROM instances WHERE sop_uid=?",
                            (exp["mojibake_sop"],)).fetchone()[0]
         check(det == "cp1251", f"mojibake detected as cp1251 (got {det})")
+        pr_dest = conn.execute("SELECT dest_group FROM studies WHERE study_uid='1.2.3.950'"
+                               ).fetchone()[0]
+        check(pr_dest == "ct", f"companion PR-only study adopted sibling archive (got {pr_dest})")
         conn.close()
 
         cmd_exclude(cfg, _Args(resolve_dup_priority=True))
