@@ -645,7 +645,12 @@ calling_aet = "MIG_PERLOVE"
 priority = 40
 charset_policy = "keep-gb"       # newer Perlove records arrive in GB -> keep GB,
                                  # only fix the (0008,0005) declaration
-charset_source = "gb18030"
+charset_source = "gb18030"       # PREFERENCE, not a blindfold: files whose text
+                                 # fails GB decoding or renders as CJK fall back to
+                                 # charset_detect_order and are transcoded to proper
+                                 # GB18030 Cyrillic.  (If your archive legitimately
+                                 # contains CJK text, add "gb18030" to
+                                 # charset_detect_order to disable the fallback.)
 is_fix_tags = ["00181150", "00181151", "00181152"]   # IS tags carrying decimals -> rounded
 max_readers = 4
 
@@ -1640,7 +1645,27 @@ def effective_codec(src: SourceCfg, declared: str, sample: bytes) -> tuple[str, 
     declared codec is trusted when it decodes the sample cleanly and plausibly;
     else detection kicks in."""
     if src.charset_source and src.charset_source != "auto":
-        return canon_codec(src.charset_source) or "latin_1", False
+        forced = canon_codec(src.charset_source) or "latin_1"
+        if not sample or all(b < 0x80 for b in sample):
+            return forced, False
+        # The override is a preference, not a blindfold: UTF-8/cp1251 Cyrillic
+        # force-read as GB18030 renders as CJK (each letter's byte pair is a
+        # valid hanzi code) or fails outright — either way the text is bogus.
+        # Fall back to the detect order (minus the forced codec) in that case.
+        suspect = False
+        try:
+            dec = sample.decode(forced)
+            suspect = sum(1 for ch in dec if CJK_RE.match(ch)) > 2 and forced not in \
+                {canon_codec(c) for c in src.charset_detect_order}
+        except (UnicodeDecodeError, ValueError):
+            suspect = True
+        if suspect:
+            cand = [c for c in src.charset_detect_order
+                    if canon_codec(c) and canon_codec(c) != forced]
+            codec, score = detect_codec(sample, cand)
+            if codec and codec != "ascii" and score >= 0.9:
+                return codec, True
+        return forced, False
     dec = declared_to_codec(declared)
     if dec is not None and dec != "latin_1":  # a real single/multibyte declaration
         try:
@@ -1879,8 +1904,36 @@ class Transformer:
                 return
             pass_name = "charset"
         if declared == target_term:
+            # Declaration already claims the target — but if the BYTES are in a
+            # different codec (e.g. cp1251 stuffed into a file declared ISO_IR
+            # 192), pydicom's read has ALREADY mangled the materialized values
+            # (invalid sequences -> U+FFFD).  Recover from the raw element
+            # bytes instead (top-level elements; nested-sequence text is left).
+            if canon_codec(true_codec or "") in ("", "ascii",
+                                                 canon_codec(declared_codec or "")):
+                return
+            for tag in list(ds.keys()):
+                item = ds.get_item(tag)
+                if item is None or getattr(item, "VR", None) not in TEXT_VRS:
+                    continue
+                raw = item.value
+                if not isinstance(raw, (bytes, bytearray)) or all(b < 0x80 for b in raw):
+                    continue
+                try:
+                    txt = bytes(raw).decode(true_codec).rstrip("\x00 ")
+                except (UnicodeDecodeError, ValueError):
+                    continue
+                vals = txt.split("\\")
+                ds[tag] = DataElement(tag, item.VR,
+                                      vals[0] if len(vals) == 1 else vals)
+                if tag in _OAS_INTEREST:
+                    self._record(changes, tag, item.VR, "", txt, pass_name + "-raw")
             return
-        reinterpret = (declared_codec is not None and declared_codec != true_codec)
+        # ISO 2022 / unknown declarations map to no python codec, but pydicom
+        # materializes them (near) byte-transparently — latin-1 recovers the
+        # original bytes so the detected codec can reinterpret them
+        recovery_codec = declared_codec or "latin_1"
+        reinterpret = (recovery_codec != true_codec)
         for dset, elem in self._iter_text_elements(ds):
             try:
                 vals = elem.value if isinstance(elem.value, (list, pydicom.multival.MultiValue)) \
@@ -1890,10 +1943,10 @@ class Transformer:
                     s = str(v) if v is not None else ""
                     if reinterpret and any(ord(c) > 127 for c in s):
                         try:
-                            s2 = s.encode(declared_codec, "strict").decode(true_codec, "strict")
+                            s2 = s.encode(recovery_codec, "strict").decode(true_codec, "strict")
                         except (UnicodeError, ValueError):
                             try:
-                                s2 = s.encode(declared_codec, "replace").decode(true_codec, "replace")
+                                s2 = s.encode(recovery_codec, "replace").decode(true_codec, "replace")
                             except (UnicodeError, ValueError):
                                 s2 = s
                         if s2 != s:
@@ -4775,6 +4828,14 @@ def build_selftest_tree(root: Path) -> dict:
     _write(pr, sante / "ps" / "pr.dcm")
     exp["pr_sop"] = "1.2.3.950.1"
 
+    # cp1251 bytes under an ISO 2022 declaration (Sante relay era): the codec
+    # mapper can't name a python codec for ISO 2022 terms — transform must
+    # still reinterpret via the byte-transparent latin-1 recovery path
+    iso22 = _mk_ds(CT_SOP, "1.2.3.970.1", "1.2.3.970", "1.2.3.970.9", "CT",
+                   "SC001", _lat("Мельник^Іван", "cp1251"), charset="ISO 2022 IR 6")
+    _write(iso22, sante / "iso2022" / "ct.dcm")
+    exp["iso2022_sop"] = "1.2.3.970.1"
+
     # -- orthanc blob: 2-hex fan-out with part10, bare, zlib, json + junk decoys
     p10 = _mk_ds(CR_SOP, "1.2.3.400.1", "1.2.3.400", "1.2.3.400.9", "CR",
                  "XR001", _lat("Сидоренко^Олена", "cp1251"), charset="ISO_IR 100")
@@ -4846,6 +4907,12 @@ def build_selftest_tree(root: Path) -> dict:
     _write(pl, per / "p1.dcm")
     exp["perlove_sop"] = "1.2.3.900.1"
     exp["perlove_name"] = "Петренко^Тарас"
+    # cp1251 text that slipped into the GB source (relay-era file): the forced
+    # gb18030 override must fall back to detection and TRANSCODE to real GB
+    pl2 = _mk_ds(CR_SOP, "1.2.3.905.1", "1.2.3.905", "1.2.3.905.9", "DX",
+                 "PL002", _lat("Коваль^Оксана", "cp1251"), charset="ISO_IR 100")
+    _write(pl2, per / "p2.dcm")
+    exp["perlove_cp1251_sop"] = "1.2.3.905.1"
 
     # -- fuji: sites via institution + folder map; ordinals within month
     fj = [("1.2.4.10.1", "1.2.4.10", "20190312", "8K Hospital", "site_a"),
@@ -5037,7 +5104,7 @@ def cmd_selftest(_cfg, args) -> int:
         cmd_scan(cfg, _Args())
         conn = db_connect(cfg.general.db_path)
         n_inst = conn.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
-        check(n_inst == 22, f"scan found 22 instances (got {n_inst})")
+        check(n_inst == 24, f"scan found 24 instances (got {n_inst})")
         n_nd = conn.execute("SELECT COUNT(*) FROM files WHERE scan_status=?",
                             (FS_NONDICOM,)).fetchone()[0]
         check(n_nd == 3, f"3 non-dicom (2 decoys + 1 DICOMDIR) (got {n_nd})")
@@ -5110,7 +5177,7 @@ def cmd_selftest(_cfg, args) -> int:
         check(n_fail == 0, f"no permanent failures (got {n_fail})")
         n_sent = conn.execute("SELECT COUNT(*) FROM instances WHERE send_status IN (?,?)",
                               (S_SENT, S_SENT_WARN)).fetchone()[0]
-        check(n_sent == 19, f"19 instances sent (got {n_sent})")
+        check(n_sent == 21, f"21 instances sent (got {n_sent})")
         conn.close()
 
         # ---- inspect received objects ----
@@ -5134,6 +5201,20 @@ def cmd_selftest(_cfg, args) -> int:
               f"perlove GB name intact (got {str(d.PatientName)!r})")
         check(str(d.ExposureTime) == "40" and str(d.Exposure) == "6",
               f"IS decimals rounded (got {d.ExposureTime!r}, {d.Exposure!r})")
+
+        d = dcmread(str(rx[exp["perlove_cp1251_sop"]]))
+        check(str(d.SpecificCharacterSet) == "GB18030",
+              "cp1251-in-perlove relabeled to GB18030")
+        check(str(d.PatientName) == "Коваль^Оксана",
+              f"cp1251-in-perlove transcoded to real GB Cyrillic, not hanzi "
+              f"(got {str(d.PatientName)!r})")
+
+        d = dcmread(str(rx[exp["iso2022_sop"]]))
+        check(str(d.SpecificCharacterSet) == "ISO_IR 192",
+              "ISO 2022-declared file relabeled to UTF-8")
+        check(str(d.PatientName) == "Мельник^Іван",
+              f"cp1251-under-ISO2022 reinterpreted, not legitimized mojibake "
+              f"(got {str(d.PatientName)!r})")
 
         d = dcmread(str(rx[exp["caret_sop"]]))
         check(str(d.PatientName) == "Ivanov^Ivan", f"caret repaired (got {d.PatientName!r})")
