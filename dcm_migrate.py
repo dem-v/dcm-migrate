@@ -963,6 +963,9 @@ CREATE INDEX IF NOT EXISTS ix_inst_pending ON instances(study_pk, send_status)
 CREATE INDEX IF NOT EXISTS ix_files_root ON files(root_id);
 CREATE INDEX IF NOT EXISTS ix_problems ON problems(code, resolved);
 CREATE INDEX IF NOT EXISTS ix_studies_claim ON studies(dest_group, source, claimed_by);
+CREATE INDEX IF NOT EXISTS ix_inst_lane ON instances(source, send_status, study_pk)
+  WHERE canonical=1;
+CREATE INDEX IF NOT EXISTS ix_ledger_inst ON send_ledger(instance_id);
 """
 
 
@@ -1000,8 +1003,15 @@ def db_init(path: str) -> None:
 
 
 def ensure_indexes(conn: sqlite3.Connection) -> None:
+    have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    missing = [n for n in re.findall(r"IF NOT EXISTS (\w+)", INDEX_DDL) if n not in have]
+    if missing:
+        log.info("db: creating %d new index(es) %s — one-time, may take many "
+                 "minutes on a large DB", len(missing), ", ".join(missing))
     conn.executescript(INDEX_DDL)
     conn.commit()
+    if missing:
+        log.info("db: index build complete")
 
 
 def meta_get(conn: sqlite3.Connection, key: str, default: str = "") -> str:
