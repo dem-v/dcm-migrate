@@ -3522,10 +3522,18 @@ class Sender(threading.Thread):
         return won
 
     def unclaim(self, study_pks: list[int]) -> None:
-        if study_pks:
-            with self.conn:
-                self.conn.executemany("UPDATE studies SET claimed_by=NULL WHERE study_pk=?",
-                                      [(pk,) for pk in study_pks])
+        if not study_pks:
+            return
+        for attempt in range(5):  # a failed unclaim only strands claims until restart
+            try:
+                with self.conn:
+                    self.conn.executemany("UPDATE studies SET claimed_by=NULL WHERE study_pk=?",
+                                          [(pk,) for pk in study_pks])
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or attempt == 4:
+                    raise
+                time.sleep(2 + attempt)
 
     def pending_instances(self, study_pk: int, source: str) -> list[sqlite3.Row]:
         return self.conn.execute(
@@ -3619,7 +3627,19 @@ class Sender(threading.Thread):
                     self.lanes.put(lane)      # re-queue BEFORE task_done: counter stays >0
                     self.lanes.task_done()
                     continue
-                had_work = self._process_lane(lane)
+                try:
+                    had_work = self._process_lane(lane)
+                except sqlite3.OperationalError as e:
+                    if "locked" not in str(e).lower():
+                        raise
+                    # another process (verify, report, ad-hoc query) is holding
+                    # the write lock — back off and retry the lane, never die
+                    log.warning("%s: database locked — backing off 15s and retrying",
+                                self.name)
+                    time.sleep(15)
+                    self.lanes.put(lane)
+                    self.lanes.task_done()
+                    continue
                 if had_work and not self.stop.is_set():
                     self.lanes.put(lane)      # more batches may remain
                 self.lanes.task_done()
@@ -3979,7 +3999,12 @@ def cmd_verify(cfg: Config, args) -> int:
     by_dest: dict[str, list] = {}
     for s in studies:
         by_dest.setdefault(s["dest_group"] or "other", []).append(s)
-    with conn, f:
+    # DB writes are buffered and committed in one short transaction AFTER the
+    # network loop: holding the write lock across minutes of C-FINDs starves
+    # any concurrently running send (its senders would see "database is locked")
+    verif_rows: list[tuple] = []
+    status_rows: list[tuple] = []
+    with f:
         for group, rows in by_dest.items():
             dest = (Destination(port=args.port, called_aet=args.called_aet)
                     if args.port else cfg.dest_for_group(group))
@@ -4018,16 +4043,18 @@ def cmd_verify(cfg: Config, args) -> int:
                     n_mismatch += 1
                 else:
                     n_unavail += 1
-                conn.execute("INSERT INTO verifications(study_pk, ts, expected, found, status) "
-                             "VALUES(?,?,?,?,?)", (s["study_pk"], now_ms(), s["sent_n"], found, status))
-                conn.execute("UPDATE studies SET verify_status=? WHERE study_pk=?",
-                             (status, s["study_pk"]))
+                verif_rows.append((s["study_pk"], now_ms(), s["sent_n"], found, status))
+                status_rows.append((status, s["study_pk"]))
                 w.writerow([final_uid, f"{group}({dest.called_aet}:{dest.port})",
                             s["sent_n"], found,
                             {V_MATCH: "MATCH", V_MISMATCH: "MISMATCH",
                              V_UNAVAILABLE: "UNAVAILABLE"}[status]])
             if established:
                 assoc.release()
+    with conn:  # short write txn: a few thousand indexed rows, milliseconds
+        conn.executemany("INSERT INTO verifications(study_pk, ts, expected, found, status) "
+                         "VALUES(?,?,?,?,?)", verif_rows)
+        conn.executemany("UPDATE studies SET verify_status=? WHERE study_pk=?", status_rows)
     log.info("verify: %d MATCH, %d MISMATCH, %d UNAVAILABLE  (csv in %s)",
              n_match, n_mismatch, n_unavail, outdir)
     conn.close()
