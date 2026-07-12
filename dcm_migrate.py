@@ -311,6 +311,12 @@ class FujiCfg:
     # studies with no/invalid StudyDate: derive the ID date from file mtime
     # (W-FUJI-MTIME-DATE) instead of blocking with H-FUJI-NO-DATE
     date_from_mtime: bool = True
+    # what happens to the original PatientID: "drop" (replace entirely) or
+    # "suffix" (append it to the generated ID: 8K319001-<sanitized original>)
+    original_id: str = "drop"
+    # date part of the generated ID: "myy" (historical, ambiguous past 999
+    # studies/month), "mmyy", or "yymm" (fixed-width, sorts chronologically)
+    id_date_format: str = "myy"
 
 
 @dataclass
@@ -505,6 +511,11 @@ def load_config(path: str) -> Config:
         errors.append("[general].diff_content_policy must be block|regenerate-uid|keep-priority")
     if cfg.general.no_identity_policy not in ("block", "placeholder"):
         errors.append("[general].no_identity_policy must be block|placeholder")
+    for s in cfg.sources:
+        if s.fuji.original_id not in ("drop", "suffix"):
+            errors.append(f"source {s.name}: [source.fuji].original_id must be drop|suffix")
+        if s.fuji.id_date_format not in ("myy", "mmyy", "yymm"):
+            errors.append(f"source {s.name}: [source.fuji].id_date_format must be myy|mmyy|yymm")
     if not cfg.server.destinations:
         errors.append("no [server.destinations.*] defined (need at least 'other')")
     if "other" not in cfg.server.destinations and set(cfg.routing.precedence) - set(cfg.server.destinations):
@@ -675,6 +686,11 @@ fallback_site = "XK"             # mixed/legacy studies with no clear site -> XK
                                  # no-leading-zero form collides (Dec-21#1 == Jan-22#1001)
 date_from_mtime = true           # no/invalid StudyDate: use the file's mtime for the ID
                                  # date (W-FUJI-MTIME-DATE) instead of H-FUJI-NO-DATE
+original_id = "drop"             # "drop": ID fully replaced; "suffix": generated ID +
+                                 # "-" + sanitized/transliterated original PatientID
+id_date_format = "myy"           # date part of the ID: "myy" (historical, ambiguous
+                                 # past 999 studies/month), "mmyy", or "yymm"
+                                 # (fixed-width, sorts chronologically)
 # Files without a site flag in InstitutionName get their site from the folder
 # they came from (case-insensitive substring match on the absolute path):
 [source.fuji.folder_site_map]
@@ -1759,17 +1775,28 @@ def fuji_site_for(src: SourceCfg, institution: str, abs_path: str) -> str | None
     return None
 
 
-def fuji_pid(site: str, study_date: str, ordinal: int, two_digit_month: bool = False) -> str:
-    """{site}{M}{YY}{###} — M is 1..12 without leading zero, YY 2-digit year,
-    ### per-month ordinal (grows past 999 naturally).
-
-    two_digit_month zero-pads M (used for the fallback site): the historical
-    no-leading-zero format is ambiguous once a month exceeds 999 studies —
-    Dec-2021 #1 (12+21+001) == Jan-2022 #1001 (1+22+1001) == "XK1221001"."""
+def fuji_pid(site: str, study_date: str, ordinal: int, fmt: str = "myy") -> str:
+    """{site}{date-part}{###} — ### is the per-site+month ordinal (grows past
+    999 naturally).  fmt selects the date part:
+      "myy"  — M (1..12, no leading zero) + YY: the historical device format.
+               AMBIGUOUS once a month exceeds 999 studies: Dec-2021 #1
+               (12+21+001) == Jan-2022 #1001 (1+22+1001) == "XK1221001".
+      "mmyy" — zero-padded MM + YY: fixed width, collision-free.
+      "yymm" — YY + zero-padded MM: fixed width, collision-free, sorts
+               chronologically."""
     yy = study_date[2:4]
-    month = int(study_date[4:6])
-    m = f"{month:02d}" if two_digit_month else str(month)
-    return f"{site}{m}{yy}{ordinal:03d}"
+    mm = study_date[4:6]
+    part = {"myy": f"{int(mm)}{yy}", "mmyy": f"{mm}{yy}", "yymm": f"{yy}{mm}"}[fmt]
+    return f"{site}{part}{ordinal:03d}"
+
+
+def fuji_pid_with_original(gen: str, old: str) -> str:
+    """original_id="suffix": '<generated>-<sanitized original>', capped at the
+    64-char LO limit.  The original is mojibake-decoded (display_text) and
+    transliterated so Cyrillic device IDs become ASCII-safe."""
+    old = translit_cyrillic(display_text((old or "").strip()))
+    old = re.sub(r"[^A-Za-z0-9.\-]+", "_", old).strip("_")
+    return f"{gen}-{old}"[:64] if old else gen
 
 
 def placeholder_pid(institution: str, study_date: str, study_time: str) -> str:
@@ -2806,12 +2833,17 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
             for (site, _ym), lst in groups.items():
                 lst.sort()
                 # fallback-site pool spans many institutions -> months exceed 999
-                # studies; only the fixed-width (zero-padded month) form is
-                # collision-free there.  8K/9K keep the historical format.
-                two_dig = bool(src.fuji.fallback_site) and site == src.fuji.fallback_site
+                # studies; under the ambiguous "myy" format only a fixed-width
+                # form is collision-free there.  8K/9K keep the configured format.
+                fmt = src.fuji.id_date_format
+                if fmt == "myy" and src.fuji.fallback_site and site == src.fuji.fallback_site:
+                    fmt = "mmyy"
                 for ordinal, (date, _t, _uid, pk) in enumerate(lst, start=1):
+                    new_id = fuji_pid(site, date, ordinal, fmt)
+                    if src.fuji.original_id == "suffix":
+                        new_id = fuji_pid_with_original(new_id, rows[pk]["pid"])
                     conn.execute("UPDATE studies SET pid_new=?, pid_rule=? WHERE study_pk=?",
-                                 (fuji_pid(site, date, ordinal, two_dig), f"fuji:{site}", pk))
+                                 (new_id, f"fuji:{site}", pk))
                     n_rewritten += 1
             # study-level IDs MUST be unique: any duplicate blocks the gate
             for pid_new, n_dup, uids in conn.execute(
@@ -5054,11 +5086,16 @@ def _selftest_units(check) -> None:
     check(codec == "utf-8", f"detect utf-8 (got {codec})")
     check(fuji_pid("8K", "20190301", 1) == "8K319001", "fuji pid format")
     check(fuji_pid("9K", "20191115", 23) == "9K1119023", "fuji pid Nov")
-    check(fuji_pid("XK", "20190301", 1, two_digit_month=True) == "XK0319001",
-          "fuji pid 2-digit month")
-    check(fuji_pid("XK", "20211201", 1, two_digit_month=True)
-          != fuji_pid("XK", "20220112", 1001, two_digit_month=True),
+    check(fuji_pid("XK", "20190301", 1, "mmyy") == "XK0319001", "fuji pid mmyy")
+    check(fuji_pid("XK", "20190301", 1, "yymm") == "XK1903001", "fuji pid yymm")
+    check(fuji_pid("XK", "20211201", 1, "yymm")
+          != fuji_pid("XK", "20220112", 1001, "yymm"),
           "fuji pid ambiguity resolved (Dec-21#1 vs Jan-22#1001)")
+    check(fuji_pid_with_original("8K319001", " 1Ð¢Ð\x92-15037 ") == "8K319001-1TV-15037",
+          f"fuji suffix mojibake-decoded+translit (got "
+          f"{fuji_pid_with_original('8K319001', ' 1Ð¢Ð' + chr(0x92) + '-15037 ')!r})")
+    check(fuji_pid_with_original("8K319001", "") == "8K319001", "fuji suffix empty old")
+    check(len(fuji_pid_with_original("XK1903001", "X" * 100)) == 64, "fuji suffix 64-cap")
     src = SourceCfg(name="t", roots=["x"], patient_id_rules=[
         PidRule(id="r", match=r"^VX-(?P<n>\d+)$", template="VX{n}")])
     check(apply_pid_rules(src, "VX-007", "", "") == ("VX007", "r"), "pid rule")
