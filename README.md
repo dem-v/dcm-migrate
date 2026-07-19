@@ -121,6 +121,25 @@ ordinals) and asserts the whole pipeline end to end.
 - The tool coerces identity attributes by design. The preview CSVs exist so
   a human signs off on every rule before anything is sent. Use them.
 
+## Control panel (Windows, no browser)
+
+```
+py dcm_migrate_gui.py [migration.toml]
+```
+
+`dcm_migrate_gui.py` is a native tkinter cockpit (stdlib only — no extra
+dependencies, no web server). It deliberately contains **zero migration
+logic**: status comes from read-only queries against the state database,
+every action runs the CLI as a child process with live colorized output in
+the console pane, and pause/resume is the engine's own PAUSE-file mechanism.
+
+- gate state banner (armed/disarmed), per-source instance-state table,
+  problem classes with ack status, verify summary
+- one-click scan / analyze / echo / send / verify (send and analyze ask for
+  confirmation), warning-ack dialog, ARM with a point-of-no-return prompt
+- live `progress:` ticker parsed from a running send, PAUSE/RESUME toggle,
+  Stop button, latest `summary.html` opener
+
 ## Operational helpers
 
 See [`tools/`](tools/) for state-DB maintenance and failure-triage scripts.
