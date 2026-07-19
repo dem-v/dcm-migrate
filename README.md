@@ -127,7 +127,11 @@ See [`tools/`](tools/) for state-DB maintenance and failure-triage scripts.
 The state database is intentionally plain SQLite — when something odd
 happens at 2 a.m., the answer is one query away.
 
-## License
+## License & credits
 
 MIT — free to use, modify and redistribute as long as the copyright /
 attribution notice is preserved. © 2026 Dmytro Valantsevych.
+
+Co-authored with Claude (Fable 5, Anthropic) — the tool was designed, built
+and hardened in an AI-pair-programming workflow over the course of a live
+production migration.
