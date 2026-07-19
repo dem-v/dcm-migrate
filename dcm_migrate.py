@@ -96,7 +96,7 @@ from pynetdicom import AE, build_context, evt
 from pynetdicom.presentation import PresentationContext
 from pynetdicom.sop_class import Verification, StudyRootQueryRetrieveInformationModelFind
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 PROG = "dcm_migrate"
 
 # Be lenient when reading legacy garbage; we do our own validation.
@@ -3508,11 +3508,17 @@ def make_ae(cfg: Config, calling_aet: str) -> AE:
 
 def plan_contexts(pairs: set[tuple[str, str]]) -> list[PresentationContext]:
     """One context per (SOPClass, file TS); Implicit LE added as the universal
-    fallback for uncompressed files.  Caller caps the batch at <=100 pairs."""
+    fallback for uncompressed files.  Caller caps the batch at <=100 pairs.
+
+    Verification is always proposed as a canary: a live server accepts it even
+    when it refuses every storage class in the batch, so the association still
+    establishes and the refused instances fail *permanently* through the
+    per-instance no-context path instead of spinning forever on
+    'no accepted presentation contexts' association aborts."""
     by_class: dict[str, set[str]] = {}
     for sop, ts in pairs:
         by_class.setdefault(sop, set()).add(ts)
-    contexts: list[PresentationContext] = []
+    contexts: list[PresentationContext] = [build_context(Verification)]
     for sop, tss in by_class.items():
         want = set(tss)
         if want & _UNCOMPRESSED_TS:
@@ -3652,10 +3658,14 @@ class Sender(threading.Thread):
         # a sick server (storage/DB down) saying 0x0122 for CT-on-a-CT-archive
         # must NOT permanently fail half the inventory (2026-07-18 incident).
         st_map = {"ok": S_SENT, "warn": S_SENT_WARN, "retry": S_FAILED_RETRY,
-                  "perm": S_FAILED_PERM, "class-stop": S_FAILED_RETRY, "assoc": S_FAILED_RETRY}
+                  "perm": S_FAILED_PERM, "class-stop": S_FAILED_RETRY, "assoc": S_FAILED_RETRY,
+                  "ctx-refused": S_FAILED_PERM}
         new_status = st_map[verdict]
         # store-level failures feed the circuit breaker too: a server that is
-        # up-but-failing (disk full) must trip the cooldown, not burn the queue
+        # up-but-failing (disk full) must trip the cooldown, not burn the queue.
+        # ctx-refused is deliberately NEUTRAL: the server explicitly refused the
+        # class at negotiation — a definitive answer from a healthy server, not
+        # a failure signal, so it must neither trip nor reset the breaker.
         if verdict in ("ok", "warn"):
             self.breaker.success(self._cur_key)
         elif verdict in ("perm", "class-stop", "retry"):
@@ -3823,6 +3833,23 @@ class Sender(threading.Thread):
                 time.sleep(self.cfg.network.backoff_initial_s)
                 return True
             self.breaker.success(key)
+            # negotiation report: classes the server refused wholesale.  Their
+            # instances fail PERMANENTLY below (verdict ctx-refused, 0x0122) —
+            # requeue with:  UPDATE instances SET send_status=0, attempts=0
+            #                WHERE send_status=3 AND last_status=290
+            accepted_cls = {str(cx.abstract_syntax) for cx in assoc.accepted_contexts}
+            refused_cls = {sop for sop, _ in pairs if sop and sop not in accepted_cls}
+            if refused_cls:
+                n_ref: dict[str, int] = {}
+                for _, insts in work:
+                    for i in insts:
+                        cls = self.sop_rev.get(i["sop_class_id"], "")
+                        if cls in refused_cls:
+                            n_ref[cls] = n_ref.get(cls, 0) + 1
+                for cls in sorted(refused_cls):
+                    log.warning("%s: %s@%s refused SOP class %s at negotiation — "
+                                "%d instance(s) in this batch -> failed-permanent (0x0122)",
+                                self.name, dest.called_aet, key, cls, n_ref.get(cls, 0))
             assoc_id = now_ms() * 10 + int(self.name[-1]) if self.name[-1].isdigit() else now_ms()
             self.writer.exec(
                 "INSERT INTO associations(assoc_id, started, source, dest, calling_aet, called_aet)"
@@ -3877,8 +3904,8 @@ class Sender(threading.Thread):
             return True
         cx = pick_context(assoc, sop_class, ts)
         if cx is None:
-            self._record_result(inst, assoc_id, None, "perm", 0, 0,
-                                f"no accepted presentation context for {sop_class}/{ts}")
+            self._record_result(inst, assoc_id, 0x0122, "ctx-refused", 0, 0,
+                                f"presentation context refused at negotiation for {sop_class}/{ts}")
             return assoc.is_established
         self.bucket.acquire(size, self.stop)
         if self.stop.is_set():
