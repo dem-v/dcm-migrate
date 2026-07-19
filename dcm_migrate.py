@@ -9,11 +9,12 @@
 dcm_migrate.py — single-file, production-grade migration of heterogeneous DICOM
 archives into a DCM4CHEE (or any DIMSE) PACS that you do NOT control.
 
-Built for the real-world case of ~8 TB of legacy data from five very different
-sources (Sante/SyngoVia CT, an Orthanc storage-area "blob pack", VXvue,
-Nanjing Perlove DR with GB-encoded text and decimal values in IS tags, and
-Fuji Prima T2 CR with unreliable per-site patient IDs), but every
-source-specific behavior is driven by the TOML config, so it generalizes.
+Built for the real-world case of a multi-terabyte hospital archive (~45 M
+instances) spread across five very different sources (Sante/SyngoVia CT, an
+Orthanc storage-area "blob pack", VXvue, Nanjing Perlove DR with GB-encoded
+text and decimal values in IS tags, and Fuji Prima T2 CR with unreliable
+per-site patient IDs), but every source-specific behavior is driven by the
+TOML config, so it generalizes.
 
 Design pillars
 ==============
@@ -48,7 +49,9 @@ Quick start
 Runs anywhere Python >= 3.11 exists; Python 3.14 recommended (zstd-compressed
 sidecars, thread-based scanning on free-threaded builds).
 
-License: MIT.  Home: shipped as a single file on purpose — copy it, read it.
+Author: Dmytro Valantsevych.  License: MIT — free to use, modify and
+redistribute as long as the copyright/attribution notice is kept (see LICENSE).
+Shipped as a single file on purpose — copy it, read it.
 """
 from __future__ import annotations
 
@@ -610,7 +613,7 @@ skip_existing_studies = false   # true => C-FIND each study first, skip if fully
 [[source]]
 name = "sante_ct"
 adapter = "filetree"
-roots = ['REPLACE_ME']
+roots = ['REPLACE_ME:\Sante Server DB']
 calling_aet = "MIG_SANTE"
 priority = 10
 charset_policy = "utf8"          # decode true encoding -> ISO_IR 192 (UTF-8)
@@ -3578,6 +3581,7 @@ class Sender(threading.Thread):
         self.skip_existing = skip_existing
         self.conn = db_connect(cfg.general.db_path)
         self.rejected_classes: set[str] = set()
+        self._cur_key = ""
 
     # ---- claiming ----------------------------------------------------------
     def claim_studies(self, lane: Lane) -> list[sqlite3.Row]:
@@ -3643,9 +3647,19 @@ class Sender(threading.Thread):
 
     def _record_result(self, inst: sqlite3.Row, assoc_id: int, status_int: int | None,
                        verdict: str, nbytes: int, dur_ms: int, error: str = "") -> None:
+        # class-stop is RETRYABLE: a healthy server saying 0x0122 for a class it
+        # genuinely lacks will exhaust max_instance_retries and settle as perm;
+        # a sick server (storage/DB down) saying 0x0122 for CT-on-a-CT-archive
+        # must NOT permanently fail half the inventory (2026-07-18 incident).
         st_map = {"ok": S_SENT, "warn": S_SENT_WARN, "retry": S_FAILED_RETRY,
-                  "perm": S_FAILED_PERM, "class-stop": S_FAILED_PERM, "assoc": S_FAILED_RETRY}
+                  "perm": S_FAILED_PERM, "class-stop": S_FAILED_RETRY, "assoc": S_FAILED_RETRY}
         new_status = st_map[verdict]
+        # store-level failures feed the circuit breaker too: a server that is
+        # up-but-failing (disk full) must trip the cooldown, not burn the queue
+        if verdict in ("ok", "warn"):
+            self.breaker.success(self._cur_key)
+        elif verdict in ("perm", "class-stop", "retry"):
+            self.breaker.failure(self._cur_key)
         attempts = inst["attempts"] + 1
         if verdict in ("retry", "assoc") and attempts >= self.cfg.network.max_instance_retries:
             new_status = S_FAILED_PERM
@@ -3741,6 +3755,10 @@ class Sender(threading.Thread):
         dest = self._dest(lane.dest_group)
         calling = self.single_aet or src.calling_aet
         key = f"{lane.source}->{lane.dest_group}"
+        self._cur_key = key
+        # per-BATCH, not per-run: a server that refused a class while sick must
+        # get a fresh chance once it recovers
+        self.rejected_classes.clear()
         claimed = [r["study_pk"] for r in studies]
         try:
             work: list[tuple[sqlite3.Row, list[sqlite3.Row]]] = []
@@ -3855,7 +3873,7 @@ class Sender(threading.Thread):
         ts = self.ts_rev.get(inst["ts_id"], "")
         if sop_class in self.rejected_classes:
             self._record_result(inst, assoc_id, 0x0122, "class-stop", 0, 0,
-                                "SOP class rejected earlier on this run")
+                                "SOP class rejected earlier in this batch")
             return True
         cx = pick_context(assoc, sop_class, ts)
         if cx is None:

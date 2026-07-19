@@ -1,0 +1,17 @@
+# local operational state — never publish
+local-archive/
+migration.toml
+state.db*
+*.db
+*.db-wal
+*.db-shm
+reports/
+sidecars/
+*.log
+PAUSE
+resent_*.txt
+
+# python
+__pycache__/
+*.pyc
+.venv/
