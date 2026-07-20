@@ -76,6 +76,7 @@ import sys
 import threading
 import time
 import tomllib
+import signal
 import uuid
 import warnings
 import zlib
@@ -96,7 +97,7 @@ from pynetdicom import AE, build_context, evt
 from pynetdicom.presentation import PresentationContext
 from pynetdicom.sop_class import Verification, StudyRootQueryRetrieveInformationModelFind
 
-VERSION = "1.0.1"
+VERSION = "1.2.0"
 PROG = "dcm_migrate"
 
 # Be lenient when reading legacy garbage; we do our own validation.
@@ -1004,6 +1005,11 @@ CREATE INDEX IF NOT EXISTS ix_studies_claim ON studies(dest_group, source, claim
 CREATE INDEX IF NOT EXISTS ix_inst_lane ON instances(source, send_status, study_pk)
   WHERE canonical=1;
 CREATE INDEX IF NOT EXISTS ix_ledger_inst ON send_ledger(instance_id);
+-- covering index for verify's per-study reconciliation: (study_pk, send_status,
+-- source) lets COUNT + MIN(source) run index-only, turning 70k×3 table-reading
+-- subqueries into pure b-tree seeks.  Partial (canonical=1) matches the query.
+CREATE INDEX IF NOT EXISTS ix_inst_verify ON instances(study_pk, send_status, source)
+  WHERE canonical=1;
 """
 
 
@@ -4100,16 +4106,25 @@ def cmd_send(cfg: Config, args) -> int:
 
 def cmd_verify(cfg: Config, args) -> int:
     conn = db_connect(cfg.general.db_path)
+    ensure_indexes(conn)
     uid_remap = {(r["old_uid"], r["uid_type"]): r["new_uid"]
                  for r in conn.execute("SELECT old_uid, uid_type, new_uid FROM uid_remap")}
+    log.info("verify: selecting sent studies to reconcile — one pass over the "
+             "inventory (minutes on a large/cold DB, esp. while a send is running; "
+             "run `maintain` if this is slow)")
+    t0 = time.monotonic()
+    # canonical=1 is added to every subquery so the partial covering index
+    # ix_inst_verify applies (only canonical instances are ever sent, so this
+    # does not change the result — send_status IN (SENT, SENT_WARN) already
+    # implies canonical — it only unlocks the index).
     studies = conn.execute(
         "SELECT s.study_pk, s.study_uid, s.dest_group, "
         " (SELECT COUNT(*) FROM instances i WHERE i.study_pk=s.study_pk "
-        "  AND i.send_status IN (?,?)) AS sent_n, "
+        "  AND i.canonical=1 AND i.send_status IN (?,?)) AS sent_n, "
         " (SELECT MIN(i.source) FROM instances i WHERE i.study_pk=s.study_pk "
-        "  AND i.send_status IN (?,?)) AS src "
+        "  AND i.canonical=1 AND i.send_status IN (?,?)) AS src "
         "FROM studies s WHERE EXISTS (SELECT 1 FROM instances i WHERE i.study_pk=s.study_pk "
-        " AND i.send_status IN (?,?))",
+        " AND i.canonical=1 AND i.send_status IN (?,?))",
         (S_SENT, S_SENT_WARN) * 3).fetchall()
     if not studies:
         log.info("verify: nothing has been sent yet")
@@ -4216,6 +4231,143 @@ def cmd_echo(cfg: Config, args) -> int:
             log.log(logging.INFO if ok else logging.ERROR,
                     "echo %-18s -> %s@%s:%-5s  %s", calling, dest.called_aet, host, dest.port, verdict)
     return 0 if failures == 0 else 1
+
+
+def cmd_doctor(cfg: Config, args) -> int:
+    """Preflight checklist: is everything in place to migrate?  Prints OK/WARN/
+    FAIL lines and exits non-zero if any FAIL.  Safe and read-only (the only
+    network it does is an optional C-ECHO to each destination)."""
+    rows: list[tuple[str, str]] = []
+    def add(level, text):
+        rows.append((level, text))
+
+    add("ok", f"Python {sys.version.split()[0]}")
+    add("ok", f"pydicom {getattr(pydicom, '__version__', '?')}, pynetdicom present")
+    add("ok", f"config parsed: {cfg.config_path}  (content hash {cfg.config_hash[:12]})")
+
+    raw = ""
+    try:
+        raw = Path(cfg.config_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    if "REPLACE_ME" in raw:
+        add("fail", "config still has REPLACE_ME placeholder(s) — fill them before sending")
+
+    if not cfg.sources:
+        add("warn", "no [[source]] blocks configured")
+    for s in cfg.sources:
+        if not s.roots:
+            add("warn", f"source {s.name!r}: no roots set")
+        for r in s.roots:
+            if "REPLACE_ME" in r:
+                add("fail", f"source {s.name!r}: root not set ({r})")
+            elif os.path.isdir(r):
+                add("ok", f"source {s.name!r}: root readable  {r}")
+            else:
+                add("warn", f"source {s.name!r}: root not found  {r}")
+
+    if not cfg.server.destinations:
+        add("fail", "no [server.destinations.*] configured")
+
+    dbp = cfg.general.db_path
+    if os.path.exists(dbp):
+        try:
+            conn = db_connect(dbp, readonly=True)
+            ni = conn.execute("SELECT COUNT(*) FROM instances WHERE canonical=1").fetchone()[0]
+            gate = meta_get(conn, "gate", "never armed").split(":")[0]
+            run = meta_get(conn, "analyze_run", "0")
+            conn.close()
+            add("ok", f"state DB: {ni:,} canonical instance(s), analyze run {run}, gate {gate}")
+        except Exception as e:
+            add("warn", f"state DB present but unreadable: {e}")
+    else:
+        add("warn", f"no state DB yet at {dbp} — start with `scan`")
+
+    try:
+        du = shutil.disk_usage(os.path.dirname(os.path.abspath(dbp)) or ".")
+        add("ok" if du.free > (5 << 30) else "warn",
+            f"free disk on DB volume: {human_bytes(du.free)}")
+    except OSError:
+        pass
+
+    host = cfg.server.host
+    if args.no_echo:
+        add("warn", "connectivity echo skipped (--no-echo)")
+    elif not host or "REPLACE_ME" in host:
+        add("warn", "server host not set — skipping connectivity echo")
+    else:
+        callings = sorted({s.calling_aet for s in cfg.sources}) or ["MIGRATE"]
+        for group, dest in sorted(cfg.server.destinations.items()):
+            for calling in callings:
+                label = f"echo {calling} -> {dest.called_aet}@{host}:{dest.port}"
+                try:
+                    ae = make_ae(cfg, calling)
+                    a = ae.associate(host, dest.port, contexts=[build_context(Verification)],
+                                     ae_title=dest.called_aet)
+                    if a.is_established:
+                        st = a.send_c_echo(); a.release()
+                        ok = bool(st) and int(st.Status) == 0
+                        add("ok" if ok else "fail", label + ("  OK" if ok else "  bad status"))
+                    else:
+                        add("fail", label + "  association rejected")
+                except Exception as e:
+                    add("fail", f"{label}  {e}")
+
+    marks = {"ok": "[ OK ]", "warn": "[WARN]", "fail": "[FAIL]"}
+    for lvl, text in rows:
+        log.log(logging.ERROR if lvl == "fail" else logging.WARNING if lvl == "warn" else logging.INFO,
+                "%s %s", marks[lvl], text)
+    nf = sum(1 for l, _ in rows if l == "fail")
+    nw = sum(1 for l, _ in rows if l == "warn")
+    log.info("doctor: %d OK, %d warning(s), %d failure(s) — %s",
+             sum(1 for l, _ in rows if l == "ok"), nw, nf,
+             "NOT READY (resolve failures above)" if nf else "no blockers found")
+    return 1 if nf else 0
+
+
+def cmd_checkconfig(cfg: Config, args) -> int:
+    """Validate the config and print a short summary.  load_config (run by main
+    before dispatch) already raised on any error, so reaching here means valid.
+    Used by the GUI config editor to validate an edited file before saving."""
+    print(f"OK: {cfg.config_path}")
+    print(f"  sources: {', '.join(s.name for s in cfg.sources) or '(none)'}")
+    print(f"  destinations: {', '.join(f'{g}->{d.called_aet}:{d.port}' for g, d in cfg.server.destinations.items()) or '(none)'}")
+    print(f"  content-config hash: {cfg.config_hash[:12]}")
+    return 0
+
+
+def cmd_maintain(cfg: Config, args) -> int:
+    """Database housekeeping for a large, long-lived state DB.  Safe to run
+    while scan/send are active (WAL); ANALYZE is the single biggest win once
+    the DB has grown, because the planner otherwise mis-costs the correlated
+    subqueries in `verify` and the send-lane scans.
+
+    With no flags, does everything except VACUUM (checkpoint + indexes +
+    ANALYZE).  Individual steps: --checkpoint --indexes --analyze --vacuum."""
+    all_default = not (args.checkpoint or args.indexes or args.analyze or args.vacuum)
+    conn = db_connect(cfg.general.db_path)
+    conn.execute("PRAGMA busy_timeout=600000")
+
+    def step(name: str, fn) -> None:
+        t = time.monotonic()
+        log.info("maintain: %s …", name)
+        fn()
+        log.info("maintain: %s done in %s", name, fmt_dur(time.monotonic() - t))
+
+    if all_default or args.checkpoint:
+        step("WAL checkpoint (truncate)", lambda: conn.execute("PRAGMA wal_checkpoint(TRUNCATE)"))
+    if all_default or args.indexes:
+        step("ensure indexes", lambda: ensure_indexes(conn))
+    if all_default or args.analyze:
+        step("ANALYZE (refresh planner statistics)", lambda: (conn.execute("ANALYZE"), conn.commit()))
+        # PRAGMA optimize applies any further stats SQLite itself judges useful
+        step("PRAGMA optimize", lambda: conn.execute("PRAGMA optimize"))
+    if args.vacuum:  # never in the default set — expensive, rewrites the whole file
+        step("VACUUM (rewrite/compact — can need free space == DB size)",
+             lambda: conn.execute("VACUUM"))
+    conn.close()
+    log.info("maintain: complete")
+    return 0
 
 
 def cmd_status(cfg: Config, args) -> int:
@@ -5446,6 +5598,15 @@ def build_parser() -> argparse.ArgumentParser:
                          "(e.g. a metadata-only store not configured as a source)")
 
     sub.add_parser("status", help="one-screen progress summary")
+    sp = sub.add_parser("doctor", help="preflight checklist: config, roots, DB, disk, connectivity")
+    sp.add_argument("--no-echo", action="store_true", help="skip the C-ECHO connectivity test")
+    sub.add_parser("checkconfig", help="validate the config file and print a summary")
+    sp = sub.add_parser("maintain", help="DB housekeeping: checkpoint, indexes, ANALYZE "
+                                         "(all but VACUUM by default)")
+    sp.add_argument("--checkpoint", action="store_true", help="only: truncate the WAL")
+    sp.add_argument("--indexes", action="store_true", help="only: create any missing indexes")
+    sp.add_argument("--analyze", action="store_true", help="only: refresh planner statistics")
+    sp.add_argument("--vacuum", action="store_true", help="also VACUUM (expensive; off by default)")
     sub.add_parser("export-mapping", help="CSV exports of ID/UID mappings")
     sub.add_parser("selftest", help="synthetic end-to-end test against a loopback SCP")
 
@@ -5456,8 +5617,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _NEEDS_CONFIG = {"scan", "analyze", "report", "exclude", "approve", "echo",
-                 "send", "verify", "status", "export-mapping", "probe", "xcheck-orthanc",
-                 "dup-audit"}
+                 "send", "verify", "status", "maintain", "checkconfig", "doctor",
+                 "export-mapping", "probe", "xcheck-orthanc", "dup-audit"}
+
+
+def _install_graceful_signals() -> None:
+    """Map polite termination signals to KeyboardInterrupt so long-running
+    commands (notably `send`) run their drain-and-commit shutdown instead of
+    dying abruptly.  On Windows the GUI's "graceful stop" sends CTRL_BREAK
+    (-> SIGBREAK); on POSIX a SIGTERM does the same.  Handlers can only be set
+    from the main thread — main() is, so this is safe."""
+    def _graceful(_signum, _frame):
+        raise KeyboardInterrupt
+    for name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _graceful)
+            except (ValueError, OSError):  # pragma: no cover - not main thread / unsupported
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -5473,6 +5651,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(log_file, args.verbose - args.quiet)
     log.debug("%s %s (python %s, GIL %s)", PROG, VERSION,
               sys.version.split()[0], "on" if GIL_ENABLED else "off")
+    _install_graceful_signals()
     dispatch: dict[str, Callable[[], int]] = {
         "init": lambda: cmd_init(args),
         "scan": lambda: cmd_scan(cfg, args),
@@ -5484,6 +5663,9 @@ def main(argv: list[str] | None = None) -> int:
         "send": lambda: cmd_send(cfg, args),
         "verify": lambda: cmd_verify(cfg, args),
         "status": lambda: cmd_status(cfg, args),
+        "doctor": lambda: cmd_doctor(cfg, args),
+        "checkconfig": lambda: cmd_checkconfig(cfg, args),
+        "maintain": lambda: cmd_maintain(cfg, args),
         "export-mapping": lambda: cmd_export_mapping(cfg, args),
         "probe": lambda: cmd_probe(cfg, args),
         "dup-audit": lambda: cmd_dup_audit(cfg, args),

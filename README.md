@@ -11,6 +11,11 @@ multi-archive DCM4CHEE over a shared 1 Gbit link, surviving source drift, a
 server outage, and every flavor of broken character encoding a decade of
 mixed-vendor operation can produce.
 
+**First time?** Launch the GUI (`py dcm_migrate_gui.py`, or double-click
+`dcm_migrate_gui.cmd`): a workflow stepper across the top always highlights your
+next step, **✓ Preflight** tells you whether you're ready to migrate, and
+**Rehearsal** runs a full synthetic pass with no real PACS. Or from the CLI:
+
 ```
 uv run dcm_migrate.py init      # writes a fully commented migration.toml
 # edit migration.toml
@@ -26,6 +31,10 @@ One file, two dependencies (`pydicom`, `pynetdicom` — both pure Python),
 SQLite + TOML from the standard library. Python ≥ 3.11; 3.14 recommended
 (zstd-compressed audit sidecars, thread-based scanning on free-threaded
 builds).
+
+**Full configuration & command reference: [CONFIG.md](CONFIG.md)** — every
+TOML key with its type, default, and meaning, plus how to run each command,
+how to stop a send (graceful / pause / force), and DB maintenance.
 
 ## Why this exists
 
@@ -144,6 +153,20 @@ the console pane, and pause/resume is the engine's own PAUSE-file mechanism.
   slot and stay mutually exclusive
 - live `progress:` ticker parsed from a running send, PAUSE/RESUME toggle,
   latest `summary.html` opener
+- **built-in config editor** with a form for every option, colour-coded by
+  consequence: green `[network]` fields save with only a send restart; amber
+  content fields disarm the gate and are locked behind an explicit opt-in.
+  Saves are validated by the engine before writing, back up the original, and
+  **preserve your comments and formatting** (surgical line edits; falls back to
+  regeneration only when it can't prove the result identical, and says so).
+- **DB maintenance** buttons (ANALYZE / rebuild indexes / checkpoint) for when
+  `verify`/`status` slow down on a large database
+- **first-run guidance**: a workflow stepper (Config → Scan → Analyze → Approve
+  → Send → Verify) that marks each stage done/next/blocked and tells you the
+  next action; a **Preflight** button (`doctor`); a **Rehearsal** button
+  (synthetic end-to-end, no PACS); hover tooltips on every action; plain-English
+  help for each problem code; a live send ETA; a Help menu; and colour-coded
+  `REPLACE_ME` flags in the config editor
 
 ## Operational helpers
 
