@@ -42,6 +42,17 @@ CONFIRM = {"send": "Start SENDING to the PACS?\n\nThe gate must be armed; "
            "analyze": "Run analyze?\n\nA new analyze run re-derives decisions "
                       "and DISARMS the send gate until re-approved."}
 
+# Concurrency model: status and verify are read-oriented and run in their OWN
+# process slots, so they never block (and are never blocked by) the heavy
+# mutating command in the "main" slot — a long verify C-FIND sweep can run
+# while a send is in flight (the engine's WAL + retry-on-locked make that safe).
+SLOTS = ("main", "status", "verify")
+INDEP_SLOTS = {"status": "status", "verify": "verify"}
+
+
+def slot_for(cmd: str) -> str:
+    return INDEP_SLOTS.get(cmd, "main")
+
 
 def engine_cmd(engine: Path, cfg: Path, cmd: str, extra: list[str]) -> list[str]:
     base = ["uv", "run", str(engine)] if shutil.which("uv") else [sys.executable, str(engine)]
@@ -51,8 +62,10 @@ def engine_cmd(engine: Path, cfg: Path, cmd: str, extra: list[str]) -> list[str]
 class App:
     def __init__(self, root: tk.Tk, cfg_path: Path, engine: Path):
         self.root, self.cfg_path, self.engine = root, cfg_path, engine
-        self.proc: subprocess.Popen | None = None
-        self.outq: queue.Queue[str | None] = queue.Queue()
+        self.jobs: dict[str, subprocess.Popen] = {}     # slot -> running child
+        self.job_cmd: dict[str, str] = {}               # slot -> command name
+        # child output: (slot, line) while running, (slot, None) with rc on exit
+        self.outq: queue.Queue[tuple[str, str | None, int | None]] = queue.Queue()
         self.uiq: queue.Queue[dict] = queue.Queue()   # refresh results -> UI thread
         self.refreshing = False
         self.db_path = self.report_dir = self.pause_file = ""
@@ -84,6 +97,8 @@ class App:
         self.gate_lbl.pack(side="left")
         self.live_lbl = ttk.Label(top, text="")   # parsed `progress:` line of a running send
         self.live_lbl.pack(side="left", padx=12)
+        self.refresh_lbl = ttk.Label(top, text="")
+        self.refresh_lbl.pack(side="left", padx=8)
         for text, fn in [("Refresh", self.refresh),
                          ("Edit config", lambda: os.startfile(self.cfg_path)),
                          ("Open report", self.open_report),
@@ -123,9 +138,20 @@ class App:
         ttk.Button(row2, text="ARM GATE", command=self.arm).pack(side="left", padx=6)
         ttk.Label(row2, text="extra args:").pack(side="left", padx=(16, 2))
         self.extra = ttk.Entry(row2, width=40); self.extra.pack(side="left")
-        self.stop_btn = ttk.Button(row2, text="Stop", command=self.stop_child, state="disabled")
-        self.stop_btn.pack(side="right", padx=2)
-        self.run_lbl = ttk.Label(row2, text="idle"); self.run_lbl.pack(side="right", padx=8)
+
+        # one row per concurrent process slot: live state + its own Stop button
+        slots = ttk.LabelFrame(right, text="running instances (status & verify run independently of the main action)",
+                               padding=2)
+        slots.pack(fill="x", pady=(2, 2))
+        self.slot_ui: dict[str, dict] = {}
+        for slot in SLOTS:
+            fr = ttk.Frame(slots); fr.pack(side="left", padx=10, pady=1)
+            lbl = ttk.Label(fr, text=f"{slot}: idle", width=30, anchor="w")
+            lbl.pack(side="left")
+            btn = ttk.Button(fr, text="Stop", width=5, state="disabled",
+                             command=lambda s=slot: self.stop_slot(s))
+            btn.pack(side="left")
+            self.slot_ui[slot] = {"lbl": lbl, "btn": btn}
 
         conf = ttk.Frame(right); conf.pack(fill="both", expand=True)
         self.console = tk.Text(conf, bg="#111318", fg="#d6d8dd", insertbackground="#d6d8dd",
@@ -137,17 +163,20 @@ class App:
         self.console.tag_configure("warn", foreground="#ffb454")
         self.console.tag_configure("ok", foreground="#7dd97b")
 
-    # ---- child processes ---------------------------------------------------
+    # ---- child processes (one per slot, running concurrently) ---------------
     def run(self, cmd: str, extra: list[str] | None = None) -> None:
-        if self.proc and self.proc.poll() is None:
-            messagebox.showwarning("busy", "an engine command is already running — "
-                                           "Stop it or wait for it to finish")
+        slot = slot_for(cmd)
+        busy = self.jobs.get(slot)
+        if busy and busy.poll() is None:
+            messagebox.showwarning(
+                "busy", f"the '{slot}' slot is already running '{self.job_cmd.get(slot, '?')}'"
+                        f" — Stop it or wait for it to finish")
             return
         if cmd in CONFIRM and not messagebox.askyesno(cmd, CONFIRM[cmd]):
             return
         argv = engine_cmd(self.engine, self.cfg_path, cmd,
                           (extra if extra is not None else self.extra.get().split()))
-        self._console(f"\n$ {' '.join(argv)}\n", "ok")
+        self._console(f"\n$ [{slot}] {' '.join(argv)}\n", "ok")
         flags = 0
         if os.name == "nt":
             flags = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -157,21 +186,22 @@ class App:
                 # (CTRL_BREAK then can't be delivered; Stop falls back to terminate)
                 flags |= subprocess.CREATE_NO_WINDOW
         try:
-            self.proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         stdin=subprocess.DEVNULL,
-                                         text=True, encoding="utf-8", errors="replace",
-                                         creationflags=flags, cwd=str(self.engine.parent))
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL,
+                                    text=True, encoding="utf-8", errors="replace",
+                                    creationflags=flags, cwd=str(self.engine.parent))
         except Exception as e:
             self._console(f"launch failed: {e}\n", "err"); return
-        self.run_lbl.config(text=f"running: {cmd}")
-        self.stop_btn.config(state="normal")
-        threading.Thread(target=self._reader, daemon=True).start()
+        self.jobs[slot] = proc
+        self.job_cmd[slot] = cmd
+        self._set_slot(slot, f"{cmd} running…", running=True)
+        threading.Thread(target=self._reader, args=(slot, proc), daemon=True).start()
 
-    def _reader(self) -> None:
-        assert self.proc and self.proc.stdout
-        for line in self.proc.stdout:
-            self.outq.put(line)
-        self.outq.put(None)   # sentinel: child exited
+    def _reader(self, slot: str, proc: subprocess.Popen) -> None:
+        assert proc.stdout
+        for line in proc.stdout:
+            self.outq.put((slot, line, None))
+        self.outq.put((slot, None, proc.wait()))   # sentinel: child exited
 
     def _pump(self) -> None:
         try:
@@ -181,38 +211,54 @@ class App:
             pass
         try:
             while True:
-                line = self.outq.get_nowait()
+                slot, line, rc = self.outq.get_nowait()
                 if line is None:
-                    rc = self.proc.wait() if self.proc else -1
-                    self._console(f"[exit {rc}]\n", "ok" if rc == 0 else "err")
-                    self.run_lbl.config(text=f"idle (last rc={rc})")
-                    self.stop_btn.config(state="disabled")
+                    self._console(f"[{slot} exit {rc}]\n", "ok" if rc == 0 else "err")
+                    self._set_slot(slot, f"done (rc={rc})", running=False)
+                    self.jobs.pop(slot, None)
                     self.refresh()
                     continue
                 tag = ("err" if " ERROR " in line else
                        "warn" if " WARNING " in line else None)
-                if " progress: " in line:
-                    self.live_lbl.config(text=line.split(" progress: ", 1)[1].strip())
-                self._console(line, tag)
+                if slot == "main":
+                    if " progress: " in line:
+                        self.live_lbl.config(text=line.split(" progress: ", 1)[1].strip())
+                    self._console(line, tag)
+                else:
+                    # independent slots: attribute in the console AND surface the
+                    # latest line in their own slot label (the "different portion")
+                    if line.strip():
+                        self._set_slot(slot, self._short(line), running=True)
+                    self._console(f"[{slot}] {line}", tag)
         except queue.Empty:
             pass
         self.root.after(200, self._pump)
 
-    def stop_child(self) -> None:
-        if not (self.proc and self.proc.poll() is None):
+    @staticmethod
+    def _short(line: str) -> str:
+        s = line.split("] ", 1)[-1].strip() if "] " in line else line.strip()
+        return (s[:34] + "…") if len(s) > 35 else s
+
+    def _set_slot(self, slot: str, text: str, *, running: bool) -> None:
+        ui = self.slot_ui[slot]
+        ui["lbl"].config(text=f"{slot}: {text}")
+        ui["btn"].config(state="normal" if running else "disabled")
+
+    def stop_slot(self, slot: str) -> None:
+        proc = self.jobs.get(slot)
+        if not (proc and proc.poll() is None):
             return
         if os.name == "nt":
             import signal
             try:
-                self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
             except Exception:
                 pass
-            self.root.after(5000, lambda: self.proc and self.proc.poll() is None
-                            and self.proc.terminate())
+            self.root.after(5000, lambda: proc.poll() is None and proc.terminate())
         else:
-            self.proc.terminate()
-        self._console("[stop requested — tip: the PAUSE button drains senders "
-                      "gracefully before you stop]\n", "warn")
+            proc.terminate()
+        hint = " — tip: PAUSE drains senders gracefully first" if slot == "main" else ""
+        self._console(f"[{slot}: stop requested{hint}]\n", "warn")
 
     def _console(self, text: str, tag: str | None = None) -> None:
         self.console.configure(state="normal")
@@ -245,7 +291,7 @@ class App:
         if self.refreshing or not self.db_path:
             return
         self.refreshing = True
-        self.run_lbl.config(text=self.run_lbl.cget("text") + "  [refreshing…]")
+        self.refresh_lbl.config(text="refreshing…")
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self) -> None:
@@ -276,7 +322,7 @@ class App:
 
     def _refresh_apply(self, out: dict) -> None:
         self.refreshing = False
-        self.run_lbl.config(text=self.run_lbl.cget("text").replace("  [refreshing…]", ""))
+        self.refresh_lbl.config(text="")
         self._sync_pause_btn()
         if "error" in out:
             self._console(f"[status refresh failed: {out['error']}]\n", "err"); return

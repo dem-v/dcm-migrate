@@ -137,8 +137,13 @@ the console pane, and pause/resume is the engine's own PAUSE-file mechanism.
   problem classes with ack status, verify summary
 - one-click scan / analyze / echo / send / verify (send and analyze ask for
   confirmation), warning-ack dialog, ARM with a point-of-no-return prompt
+- **concurrent process slots**: `status` and `verify` run as their own
+  independent instances, so a long `verify` C-FIND sweep (or a `status`
+  count) can run *while a send is in flight* — each slot has its own live
+  state line and Stop button; the heavy mutating commands share one "main"
+  slot and stay mutually exclusive
 - live `progress:` ticker parsed from a running send, PAUSE/RESUME toggle,
-  Stop button, latest `summary.html` opener
+  latest `summary.html` opener
 
 ## Operational helpers
 
