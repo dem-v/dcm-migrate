@@ -36,7 +36,7 @@ import tomllib
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 try:                       # comment-preserving TOML round-tripper (pure Python)
     import tomlkit
@@ -50,7 +50,7 @@ SEV_NAMES = {0: "info", 1: "WARN", 2: "HARD"}
 VERIFY_NAMES = {1: "match", 2: "MISMATCH", 3: "unavailable"}
 
 ACTIONS = ["scan", "analyze", "report", "echo", "send", "verify",
-           "status", "dup-audit", "export-mapping"]
+           "status", "dup-audit", "export-mapping", "probe", "xcheck-orthanc"]
 
 # hover help for the action buttons (first-timer orientation)
 ACTION_TIP = {
@@ -67,6 +67,24 @@ ACTION_TIP = {
     "status": "One-screen progress summary (per-source counts).",
     "dup-audit": "Review duplicate groups found by analyze.",
     "export-mapping": "Write CSVs of the old->new PatientID / UID mappings.",
+    "probe": "Forensically inspect files classified non-DICOM / unreadable (random "
+             "sample). Read-only — the tool for investigating H-UNREADABLE / H-TRUNCATED.",
+    "xcheck-orthanc": "Cross-check that every instance referenced by an Orthanc / "
+                      "DICOMweb metadata store is present in the inventory. Read-only.",
+}
+
+# Hard blockers that can be cleared WITHOUT discarding data, by a config change +
+# re-analyze (as opposed to exclude, which drops the objects).  Shown as a guided
+# "Fix in config…" shortcut when such a blocker is selected.
+PROBLEM_FIX = {
+    "H-DUP-CONFLICT": 'set [general] diff_content_policy = "regenerate-uid" '
+                      "(keeps every copy with fresh UIDs)",
+    "H-NO-PATIENT-IDENTITY": 'set [general] no_identity_policy = "placeholder" '
+                             "(keeps the study under a synthesized ID)",
+    "H-PID-RULE-MISS": "add a [[source.patient_id_rule]], or set "
+                       "[source.id_generator] fallback_site",
+    "H-PID-COLLISION": 'set [source.id_generator] id_date_format = "mmyy" (or "yymm")',
+    "H-IDGEN-NO-DATE": "set [source.id_generator] date_from_mtime = true (else exclude)",
 }
 
 # plain-English explanation per problem code, shown when a problem row is selected
@@ -108,6 +126,9 @@ PROBLEM_HELP = {
 # guided workflow stages (order matters); state derived from the DB in refresh
 STAGES = ["Config", "Scan", "Analyze", "Approve", "Send", "Verify"]
 
+# how often to auto-refresh the status tables while a job is running (ms)
+AUTO_REFRESH_MS = 15000
+
 
 class Tooltip:
     """Lightweight hover tooltip (stdlib tkinter, no deps)."""
@@ -139,8 +160,13 @@ CONFIRM = {"send": "Start SENDING to the PACS?\n\nThe gate must be armed; "
 # process slots, so they never block (and are never blocked by) the heavy
 # mutating command in the "main" slot — a long verify C-FIND sweep can run
 # while a send is in flight (the engine's WAL + retry-on-locked make that safe).
-SLOTS = ("main", "status", "verify")
-INDEP_SLOTS = {"status": "status", "verify": "verify"}
+SLOTS = ("main", "status", "verify", "read")
+# status/verify get a dedicated slot each; the remaining read-only commands share
+# one "read" slot — none of them mutate, so they never block (or are blocked by)
+# the heavy command in "main".  Only mutating commands land in "main".
+INDEP_SLOTS = {"status": "status", "verify": "verify",
+               "report": "read", "dup-audit": "read", "export-mapping": "read",
+               "probe": "read", "xcheck-orthanc": "read"}
 
 
 def slot_for(cmd: str) -> str:
@@ -161,7 +187,7 @@ class App:
         self.outq: queue.Queue[tuple[str, str | None, int | None]] = queue.Queue()
         self.uiq: queue.Queue[dict] = queue.Queue()   # refresh results -> UI thread
         self.refreshing = False
-        self.db_path = self.report_dir = self.pause_file = ""
+        self.db_path = self.report_dir = self.pause_file = self.log_file = ""
         self.has_replace_me = False
         self.last_pending = 0                 # pending instances at last refresh (for ETA)
         self._eta_prev: tuple[float, int] | None = None
@@ -173,6 +199,7 @@ class App:
         self._build()
         self.root.after(200, self._pump)
         self.refresh()
+        self.root.after(AUTO_REFRESH_MS, self._auto_refresh)
 
     # ---- config (only the few [general] paths; engine re-parses on every run)
     def _load_cfg(self) -> None:
@@ -185,6 +212,7 @@ class App:
             self.db_path = g.get("db_path", "")
             self.report_dir = g.get("report_dir", "")
             self.pause_file = g.get("pause_file", "")
+            self.log_file = g.get("log_file", "")
         except Exception as e:
             messagebox.showerror("config", f"cannot parse {self.cfg_path}:\n{e}")
 
@@ -210,7 +238,7 @@ class App:
                          ("New workspace", self.new_workspace),
                          ("Edit raw TOML", lambda: os.startfile(self.cfg_path)),
                          ("Open report", self.open_report),
-                         ("Open log dir", lambda: os.startfile(str(Path(self.db_path).parent)))]:
+                         ("Open log", self.open_log)]:
             ttk.Button(top, text=text, command=fn).pack(side="right", padx=2)
 
         # guided workflow stepper
@@ -241,13 +269,14 @@ class App:
         self.src_tree.pack(fill="x", pady=(0, 2))
         self.empty_lbl = ttk.Label(left, text="", foreground="#3366cc", wraplength=360)
         self.empty_lbl.pack(anchor="w", pady=(0, 6))
-        ttk.Label(left, text="Problems (current analyze run) — click a row for help").pack(anchor="w")
+        ttk.Label(left, text="Unresolved problems (current analyze run) — click a row for help").pack(anchor="w")
         self.prob_tree = ttk.Treeview(left, columns=("count", "acked"), height=9)
         self.prob_tree.heading("#0", text="severity / code"); self.prob_tree.column("#0", width=260)
         self.prob_tree.heading("count", text="count"); self.prob_tree.column("count", width=90, anchor="e")
         self.prob_tree.heading("acked", text="acked"); self.prob_tree.column("acked", width=60, anchor="center")
         self.prob_tree.pack(fill="both", expand=True)
         self.prob_tree.bind("<<TreeviewSelect>>", self._on_prob_select)
+        self.prob_tree.bind("<Double-1>", self._on_prob_dblclick)
         self.prob_help = ttk.Label(left, text="", foreground="#555", wraplength=380, justify="left")
         self.prob_help.pack(anchor="w", pady=2)
         self.verify_lbl = ttk.Label(left, text=""); self.verify_lbl.pack(anchor="w", pady=4)
@@ -255,16 +284,38 @@ class App:
         # right: actions + console
         right = ttk.Frame(pane, padding=4); pane.add(right, weight=3)
         row = ttk.Frame(right); row.pack(fill="x")
+        self.action_btns: dict[str, ttk.Button] = {}
         for cmd in ACTIONS:
             b = ttk.Button(row, text=cmd, width=9, command=lambda c=cmd: self.run(c))
             b.pack(side="left", padx=1, pady=1)
+            self.action_btns[cmd] = b
             if cmd in ACTION_TIP:
                 Tooltip(b, ACTION_TIP[cmd])
         row2 = ttk.Frame(right); row2.pack(fill="x", pady=2)
         ttk.Button(row2, text="Ack warnings…", command=self.ack_dialog).pack(side="left", padx=1)
-        ttk.Button(row2, text="ARM GATE", command=self.arm).pack(side="left", padx=6)
-        ttk.Label(row2, text="extra args:").pack(side="left", padx=(16, 2))
-        self.extra = ttk.Entry(row2, width=40); self.extra.pack(side="left")
+        exb = ttk.Button(row2, text="Exclude / resolve…", command=self.exclude_dialog)
+        exb.pack(side="left", padx=1)
+        Tooltip(exb, "Resolve hard blockers (H-*) by excluding the matching files/studies "
+                     "— by problem class, path glob, study UID, or file id. Excluding "
+                     "disarms the gate and DISCARDS those objects.")
+        self.fix_btn = ttk.Button(row2, text="Fix in config…", command=self._fix_in_config,
+                                  state="disabled")
+        self.fix_btn.pack(side="left", padx=1)
+        Tooltip(self.fix_btn, "For blockers that a config policy can clear WITHOUT discarding "
+                              "data (dup conflicts, no-identity, ID-rule miss/collision): opens "
+                              "the config editor at the right setting, then re-analyze.")
+        self.arm_btn = ttk.Button(row2, text="ARM GATE", command=self.arm)
+        self.arm_btn.pack(side="left", padx=6)
+        ttk.Label(row2, text="extra args →").pack(side="left", padx=(16, 2))
+        self.extra = ttk.Entry(row2, width=34); self.extra.pack(side="left")
+        xclr = ttk.Button(row2, text="✕", width=2, command=lambda: self.extra.delete(0, "end"))
+        xclr.pack(side="left", padx=1)
+        Tooltip(self.extra, "Appended to the NEXT top-row action button you click "
+                            "(scan / analyze / … / probe). NOT used by the maintenance, ack, "
+                            "exclude, Fix-in-config or ARM buttons. It is NOT cleared "
+                            "automatically — the full command is always echoed in the console "
+                            "before it runs; click ✕ to clear.")
+        Tooltip(xclr, "Clear the extra-args field")
 
         # DB maintenance (all run in the 'main' slot — they mutate the DB but are
         # safe alongside a send thanks to WAL; ANALYZE is the fix for a slow verify)
@@ -279,13 +330,13 @@ class App:
         ttk.Label(maint, text="(run when verify/status feel slow on a large DB)").pack(side="left", padx=8)
 
         # one row per concurrent process slot: live state + its own Stop button
-        slots = ttk.LabelFrame(right, text="running instances (status & verify run independently of the main action)",
+        slots = ttk.LabelFrame(right, text="running instances (status / verify / read-only queries run independently of the main action)",
                                padding=2)
         slots.pack(fill="x", pady=(2, 2))
         self.slot_ui: dict[str, dict] = {}
         for slot in SLOTS:
-            fr = ttk.Frame(slots); fr.pack(side="left", padx=10, pady=1)
-            lbl = ttk.Label(fr, text=f"{slot}: idle", width=30, anchor="w")
+            fr = ttk.Frame(slots); fr.pack(side="left", padx=6, pady=1)
+            lbl = ttk.Label(fr, text=f"{slot}: idle", width=20, anchor="w")
             lbl.pack(side="left")
             btn = ttk.Button(fr, text="Stop", width=5, state="disabled",
                              command=lambda s=slot: self.stop_slot(s))
@@ -364,6 +415,14 @@ class App:
                 "busy", f"the '{slot}' slot is already running '{self.job_cmd.get(slot, '?')}'"
                         f" — Stop it or wait for it to finish")
             return
+        # guide, don't fail: the engine refuses `send` on a disarmed gate — catch it here
+        if cmd == "send" and not getattr(self, "_armed", False):
+            messagebox.showwarning(
+                "gate not armed",
+                "The send gate is not armed for the current analyze run + config.\n\n"
+                "Resolve every hard blocker, acknowledge every warning class, then "
+                "click ARM GATE before sending.")
+            return
         if cmd in CONFIRM and not messagebox.askyesno(cmd, CONFIRM[cmd]):
             return
         argv = engine_cmd(self.engine, self.cfg_path, cmd,
@@ -440,8 +499,10 @@ class App:
     _PROG_RE = re.compile(r"sent=(\d+) warn=(\d+) failed=(\d+) skipped=(\d+)")
 
     def _eta(self, snapshot: str) -> str:
-        """Estimate remaining time from the delta between two progress snapshots
-        and the pending count captured at the last refresh."""
+        """Estimate remaining time from the send rate (delta between two progress
+        snapshots) and the live pending count.  `last_pending` is refreshed during
+        the send (auto-refresh), so it already IS the remaining count — do NOT
+        also subtract `done`, or the sent instances get counted twice."""
         m = self._PROG_RE.search(snapshot)
         if not m:
             return ""
@@ -454,7 +515,7 @@ class App:
         dt, dn = now - prev[0], done - prev[1]
         if dt <= 0 or dn <= 0:
             return ""
-        remaining = max(0, self.last_pending - done)
+        remaining = max(0, self.last_pending)
         secs = remaining / (dn / dt)
         h, rem = divmod(int(secs), 3600)
         mnt = rem // 60
@@ -561,6 +622,13 @@ class App:
         self.pause_btn.config(text="RESUME senders" if paused else "PAUSE senders")
 
     # ---- status refresh (read-only DB, off the UI thread) -------------------
+    def _auto_refresh(self) -> None:
+        # keep the status tables / stepper live during a long send (the progress
+        # ticker updates every line, but the counts only move on refresh)
+        if any(p.poll() is None for p in self.jobs.values()):
+            self.refresh()
+        self.root.after(AUTO_REFRESH_MS, self._auto_refresh)
+
     def refresh(self) -> None:
         if self.refreshing or not self.db_path:
             return
@@ -579,8 +647,11 @@ class App:
             out["src"] = conn.execute(
                 "SELECT source, send_status, COUNT(*) n FROM instances "
                 "WHERE canonical=1 GROUP BY source, send_status").fetchall()
+            # resolved=0 only: excluded / policy-resolved problems must not keep
+            # showing (or inflating the blocker count) after they've been cleared.
             out["prob"] = conn.execute(
-                "SELECT severity, code, COUNT(*) n FROM problems WHERE run_id=? "
+                "SELECT severity, code, COUNT(*) n FROM problems "
+                "WHERE run_id=? AND resolved=0 "
                 "GROUP BY severity, code ORDER BY severity DESC, n DESC",
                 (out["run"],)).fetchall()
             out["acked"] = {r[0] for r in conn.execute(
@@ -602,18 +673,21 @@ class App:
             self._console(f"[status refresh failed: {out['error']}]\n", "err"); return
         gate = out["gate"]
         armed = gate.startswith("armed")
+        self._armed = armed
+        self.action_btns["send"].config(state="normal" if armed else "disabled")
         self.gate_lbl.config(text=f"gate: {gate.split(':')[0]}   analyze run: {out['run']}",
                              bg="#1d5c2d" if armed else "#6e1f1f", fg="white")
         agg: dict[str, dict[int, int]] = {}
         for r in out["src"]:
             agg.setdefault(r["source"], {})[r["send_status"]] = r["n"]
         self.src_tree.delete(*self.src_tree.get_children())
-        pending = sent = total = 0
+        pending = sent = total = failed = 0
         for src in sorted(agg):
             c = agg[src]
             pend = c.get(S_PENDING, 0) + c.get(S_FAILED_RETRY, 0)
             snt = c.get(S_SENT, 0) + c.get(S_SENT_WARN, 0)
             pending += pend; sent += snt; total += sum(c.values())
+            failed += c.get(S_FAILED_PERM, 0)
             self.src_tree.insert("", "end", text=src, values=(
                 f"{pend:,}", f"{c.get(S_SENT, 0):,}", f"{c.get(S_SENT_WARN, 0):,}",
                 f"{c.get(S_FAILED_PERM, 0):,}",
@@ -629,6 +703,12 @@ class App:
             self.prob_tree.insert("", "end",
                                   text=f"{SEV_NAMES.get(r['severity'], r['severity'])}  {r['code']}",
                                   values=(f"{r['n']:,}", acked))
+        # remember what still blocks arming, so ARM can pre-check instead of failing
+        self._nblock = nblock
+        self._unacked = [r["code"] for r in out["prob"]
+                         if r["severity"] == 1 and r["code"] not in out["acked"]]
+        ready = out["run"] > 0 and nblock == 0 and not self._unacked
+        self.arm_btn.config(state="normal" if ready else "disabled")
         v = out["verify"]
         self.verify_lbl.config(text="verify: " + ", ".join(
             f"{v.get(k, 0):,} {n}" for k, n in VERIFY_NAMES.items()) if v else "verify: not run")
@@ -640,9 +720,9 @@ class App:
                                   else "No inventory yet — run Scan to build it.")
         else:
             self.empty_lbl.config(text="")
-        self._update_stepper(out, total, pending, sent, nblock, armed)
+        self._update_stepper(out, total, pending, sent, nblock, armed, failed)
 
-    def _update_stepper(self, out, total, pending, sent, nblock, armed):
+    def _update_stepper(self, out, total, pending, sent, nblock, armed, failed=0):
         run = out["run"]
         unacked = any(r["severity"] == 1 and r["code"] not in out["acked"] for r in out["prob"])
         done = {
@@ -671,14 +751,43 @@ class App:
                 self.step_ui[s].config(text=f"▸ {s}", fg="white", bg="#3366cc")
             else:
                 self.step_ui[s].config(text=f"{s}", fg="#888", bg=self.root.cget("bg"))
-        self.step_hint.config(text=hints.get(current, "Migration complete — all stages done. ✓"))
+        done_msg = ("Migration complete — all stages done. ✓" if not failed else
+                    f"All stages done, but {failed:,} instance(s) failed permanently — "
+                    "check verify and the failed reports.")
+        self.step_hint.config(text=hints.get(current, done_msg))
 
     def _on_prob_select(self, _e=None):
         sel = self.prob_tree.selection()
         if not sel:
             return
         code = self.prob_tree.item(sel[0])["text"].split()[-1]
-        self.prob_help.config(text=f"{code}: {PROBLEM_HELP.get(code, 'no description available.')}")
+        help_txt = f"{code}: {PROBLEM_HELP.get(code, 'no description available.')}"
+        fix = PROBLEM_FIX.get(code)
+        self._sel_fix_code = code if fix else None
+        self.fix_btn.config(state="normal" if fix else "disabled")
+        if fix:
+            help_txt += f"\n▶ Keep the data — Fix in config: {fix}, then re-analyze."
+        self.prob_help.config(text=help_txt)
+
+    def _on_prob_dblclick(self, e=None):
+        # only HARD rows resolve via exclude; double-clicking a warning/info row
+        # (which you acknowledge, not exclude) should do nothing
+        row = self.prob_tree.identify_row(e.y) if e else (self.prob_tree.selection() or [None])[0]
+        if row and self.prob_tree.item(row)["text"].startswith("HARD"):
+            self.prob_tree.selection_set(row)
+            self.exclude_dialog()
+
+    def _fix_in_config(self) -> None:
+        code = getattr(self, "_sel_fix_code", None)
+        if not code:
+            return
+        messagebox.showinfo(
+            "Fix in config",
+            f"To clear {code} WITHOUT discarding data:\n\n{PROBLEM_FIX[code]}\n\n"
+            "Opening the config editor (tick 'Enable editing of GATE-AFFECTING "
+            "fields' to change it). After you save, the gate disarms — re-run "
+            "Analyze, re-ack warnings, then ARM again.")
+        self.open_config_editor()
 
     # ---- gate actions --------------------------------------------------------
     def ack_dialog(self) -> None:
@@ -712,7 +821,72 @@ class App:
                 self.run("approve", ["--ack", *sel, "--note", "acked via GUI"])
         ttk.Button(bar, text="Acknowledge selected", command=go).pack(side="right")
 
+    def exclude_dialog(self) -> None:
+        """Resolve hard blockers by excluding matching files/studies (disarms the
+        gate).  Prefilled with the selected problem row's code when it's an H-*."""
+        sel = self.prob_tree.selection()
+        pre = ""
+        if sel:
+            txt = self.prob_tree.item(sel[0])["text"]
+            code = txt.split()[-1]
+            if txt.startswith("HARD"):
+                pre = code
+        dlg = tk.Toplevel(self.root); dlg.title("Exclude / resolve blockers")
+        dlg.transient(self.root)
+        ttk.Label(dlg, wraplength=430, justify="left", padding=(12, 10, 12, 4),
+                  text="Exclude the files/studies matched below. Excluded objects become "
+                       "non-canonical and are never sent. This DISARMS the gate (re-ack "
+                       "warnings and ARM again afterwards). Fill only what you need:").pack(anchor="w")
+        frm = ttk.Frame(dlg, padding=(12, 0)); frm.pack(fill="x")
+        fields = [("Problem class (e.g. H-TRUNCATED)", "problem", pre),
+                  ("Path glob (e.g. *.partial)", "path-glob", ""),
+                  ("Study UID", "study-uid", ""),
+                  ("File id (from problems.csv)", "file-id", "")]
+        vars_: dict[str, tk.StringVar] = {}
+        for label, key, default in fields:
+            r = ttk.Frame(frm); r.pack(fill="x", pady=1)
+            ttk.Label(r, text=label, width=28, anchor="w").pack(side="left")
+            v = tk.StringVar(value=default); vars_[key] = v
+            ttk.Entry(r, textvariable=v).pack(side="left", fill="x", expand=True)
+        dupv = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, variable=dupv,
+                        text="Resolve all H-DUP-CONFLICT by source priority").pack(anchor="w", pady=(4, 0))
+
+        def go():
+            args: list[str] = []
+            for key in ("problem", "path-glob", "study-uid", "file-id"):
+                val = vars_[key].get().strip()
+                if val:
+                    args += [f"--{key}", val]
+            if dupv.get():
+                args.append("--resolve-dup-priority")
+            dlg.destroy()
+            if not args:
+                messagebox.showinfo("exclude", "nothing specified"); return
+            if messagebox.askyesno("exclude",
+                                   "Exclude matching files/studies and DISARM the gate?\n\n"
+                                   f"dcm_migrate exclude {' '.join(args)}", icon="warning"):
+                self.run("exclude", args)
+        bar = ttk.Frame(dlg, padding=(12, 8, 12, 12)); bar.pack(fill="x")
+        ttk.Button(bar, text="Exclude", command=go).pack(side="right")
+        ttk.Button(bar, text="Cancel", command=dlg.destroy).pack(side="right", padx=4)
+
     def arm(self) -> None:
+        # pre-check so ARM never just errors into the console
+        reasons = []
+        if getattr(self, "_nblock", 0):
+            reasons.append(f"{self._nblock:,} unresolved hard blocker(s) "
+                           "— exclude them or Fix in config, then re-analyze")
+        if getattr(self, "_unacked", None):
+            reasons.append(f"{len(self._unacked)} unacknowledged warning class(es): "
+                           + ", ".join(self._unacked))
+        if reasons:
+            messagebox.showwarning(
+                "cannot arm yet",
+                "The gate cannot be armed until these are cleared:\n\n• "
+                + "\n• ".join(reasons)
+                + "\n\n(The Approve step of the stepper tracks what's left.)")
+            return
         if messagebox.askyesno(
                 "ARM GATE",
                 "Arm the send gate?\n\nThis is the point of no return: the next "
@@ -728,6 +902,26 @@ class App:
             os.startfile(str(runs[-1] / "summary.html"))
         except Exception as e:
             messagebox.showinfo("report", f"no report found: {e}")
+
+    def _log_path(self) -> Path | None:
+        """Effective log destination: [general].log_file, resolved against the
+        engine dir when it's relative (that's the cwd children run in)."""
+        if not self.log_file:
+            return None
+        p = Path(self.log_file)
+        return p if p.is_absolute() else (self.engine.parent / p)
+
+    def open_log(self) -> None:
+        lp = self._log_path()
+        if lp and lp.exists():
+            os.startfile(str(lp)); return
+        # not written yet: open the folder it will live in, else the DB folder
+        folder = lp.parent if lp else (Path(self.db_path).parent if self.db_path else None)
+        if folder and folder.exists():
+            os.startfile(str(folder))
+        else:
+            messagebox.showinfo("log", f"no log file yet"
+                                       + (f" (expected at {lp})" if lp else " (log_file unset in [general])"))
 
     def _get_schema(self) -> dict | None:
         """Fetch the config schema from the engine (cached).  The GUI can't import

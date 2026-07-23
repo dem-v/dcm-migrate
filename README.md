@@ -143,16 +143,29 @@ every action runs the CLI as a child process with live colorized output in
 the console pane, and pause/resume is the engine's own PAUSE-file mechanism.
 
 - gate state banner (armed/disarmed), per-source instance-state table,
-  problem classes with ack status, verify summary
-- one-click scan / analyze / echo / send / verify (send and analyze ask for
-  confirmation), warning-ack dialog, ARM with a point-of-no-return prompt
-- **concurrent process slots**: `status` and `verify` run as their own
-  independent instances, so a long `verify` C-FIND sweep (or a `status`
-  count) can run *while a send is in flight* — each slot has its own live
-  state line and Stop button; the heavy mutating commands share one "main"
-  slot and stay mutually exclusive
+  **unresolved** problem classes with ack status (excluded / policy-resolved
+  findings drop off automatically), verify summary
+- one-click scan / analyze / echo / send / verify / probe / xcheck-orthanc
+  (send and analyze ask for confirmation), warning-ack dialog, an
+  exclude/resolve dialog for hard blockers (by problem class, path glob, study
+  UID or file id — double-click a blocker row to prefill it), a **Fix in
+  config…** shortcut that jumps a data-preserving blocker (dup conflict,
+  no-identity, ID rule miss/collision) straight to the config setting that
+  clears it, and an **ARM** button that stays disabled (and pre-checks) until
+  every blocker is resolved and every warning acked — so it guides rather than
+  errors. **Send** is likewise disabled until the gate is armed, so it never
+  fails into the console on a disarmed gate
+- **concurrent process slots**: `status`, `verify` and the read-only queries
+  (`report` / `dup-audit` / `export-mapping` / `probe` / `xcheck-orthanc`, on a
+  shared `read` slot) run as their own independent instances, so a long
+  `verify` C-FIND sweep can run *while a send is in flight* — each slot has its
+  own live state line and Stop button; only the heavy mutating commands share
+  the "main" slot and stay mutually exclusive
 - live `progress:` ticker parsed from a running send, PAUSE/RESUME toggle,
-  latest `summary.html` opener
+  latest `summary.html` opener, and an **Open log** button pointed at the
+  engine's own `[general].log_file`; the status tables and stepper
+  **auto-refresh while any job runs**, so the counts stay live during a
+  multi-night send, not just the progress line
 - **built-in config editor**, schema-driven (the form is generated from the
   engine's own `schema`, so it never drifts) with full **structural editing** —
   add / remove / reorder sources, archives (destinations), ID rules, routing

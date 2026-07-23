@@ -97,7 +97,7 @@ from pynetdicom import AE, build_context, evt
 from pynetdicom.presentation import PresentationContext
 from pynetdicom.sop_class import Verification, StudyRootQueryRetrieveInformationModelFind
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 PROG = "dcm_migrate"
 
 # Be lenient when reading legacy garbage; we do our own validation.
