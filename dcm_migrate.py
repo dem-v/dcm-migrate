@@ -97,7 +97,7 @@ from pynetdicom import AE, build_context, evt
 from pynetdicom.presentation import PresentationContext
 from pynetdicom.sop_class import Verification, StudyRootQueryRetrieveInformationModelFind
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PROG = "dcm_migrate"
 
 # Be lenient when reading legacy garbage; we do our own validation.
@@ -2301,13 +2301,45 @@ class ScanIngestor:
                  rec["charset"], rec["facts"], rec["is_decimal_tags"], rec["text_sample"]))
 
 
-def _load_known(conn: sqlite3.Connection, root_id: int) -> dict[bytes, tuple[int, int, int]]:
-    known: dict[bytes, tuple[int, int, int]] = {}
-    for rel, size, mt, st in conn.execute(
-            "SELECT rel_path, size, mtime_ns, scan_status FROM files WHERE root_id=?", (root_id,)):
-        h = hashlib.blake2b(rel.encode("utf-8", "surrogateescape"), digest_size=16).digest()
-        known[h] = (size, mt, st)
-    return known
+def _walk_with_prev(conn: sqlite3.Connection, src: SourceCfg, root_ids: dict[str, int],
+                    rescan: str, chunk: int = 500):
+    """Yield (root, abs_path, size, mtime_ns, rel, prev) for every candidate file,
+    where prev is the DB's (size, mtime_ns, scan_status) for that file or None.
+
+    Prior state is fetched in small BATCHES via the UNIQUE(root_id, rel_path)
+    index — never the whole files table at once.  The old approach preloaded a
+    dict of every known file (~300 bytes/entry), which reached ~15 GB on a 45 M
+    file archive; this keeps resident memory at O(chunk)."""
+    buf: list[tuple] = []
+
+    def drain():
+        by_root: dict[str, list[int]] = {}
+        for idx, item in enumerate(buf):
+            by_root.setdefault(item[0], []).append(idx)
+        prev: list = [None] * len(buf)
+        if rescan != "full":
+            for root, idxs in by_root.items():
+                rid = root_ids.get(root)
+                if rid is None:
+                    continue
+                # sub-batch to stay under SQLite's bound-variable limit
+                for s in range(0, len(idxs), chunk):
+                    sub = idxs[s:s + chunk]
+                    rels = [buf[i][4] for i in sub]
+                    q = ("SELECT rel_path, size, mtime_ns, scan_status FROM files "
+                         f"WHERE root_id=? AND rel_path IN ({','.join('?' * len(rels))})")
+                    got = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(q, (rid, *rels))}
+                    for i in sub:
+                        prev[i] = got.get(buf[i][4])
+        for item, pv in zip(buf, prev):
+            yield item[0], item[1], item[2], item[3], item[4], pv
+        buf.clear()
+
+    for root, abs_path, size, mtime_ns in iter_source_files(src):
+        buf.append((root, abs_path, size, mtime_ns, os.path.relpath(abs_path, root)))
+        if len(buf) >= chunk:
+            yield from drain()
+    yield from drain()
 
 
 class SourceScanJob(threading.Thread):
@@ -2353,10 +2385,11 @@ class SourceScanJob(threading.Thread):
                                    args=(out_q, drain_done), daemon=True)
         drainer.start()
 
-        # register roots + load known-file maps (stat-only incremental rescan)
+        # register roots (stat-only incremental rescan looks prior state up in
+        # batches during the walk — no full known-file map is held in memory)
+        root_ids: dict[str, int] = {}
         conn = db_connect(self.cfg.general.db_path, readonly=False)
         try:
-            known_by_root: dict[str, dict[bytes, tuple[int, int, int]]] = {}
             for root in src.roots:
                 self.writer.flush()
                 rid_row = conn.execute("SELECT root_id FROM roots WHERE source=? AND path=?",
@@ -2367,7 +2400,7 @@ class SourceScanJob(threading.Thread):
                     conn.commit()
                     rid_row = conn.execute("SELECT root_id FROM roots WHERE source=? AND path=?",
                                            (src.name, root)).fetchone()
-                known_by_root[root] = _load_known(conn, rid_row[0])
+                root_ids[root] = rid_row[0]
         finally:
             conn.close()
 
@@ -2377,14 +2410,13 @@ class SourceScanJob(threading.Thread):
             if dicom_uuids is not None:
                 log.info("%s: Orthanc index lists %d DICOM attachments", src.name, len(dicom_uuids))
 
+        conn_r = db_connect(self.cfg.general.db_path, readonly=True)
         try:
-            for root, abs_path, size, mtime_ns in iter_source_files(src):
+            for root, abs_path, size, mtime_ns, rel, prev in _walk_with_prev(
+                    conn_r, src, root_ids, self.rescan):
                 if self.stop.is_set():
                     break
                 self.stats["seen"] += 1
-                rel = os.path.relpath(abs_path, root)
-                h = hashlib.blake2b(rel.encode("utf-8", "surrogateescape"), digest_size=16).digest()
-                prev = known_by_root.get(root, {}).get(h)
                 if prev is not None and self.rescan != "full":
                     psize, pmt, pstatus = prev
                     unchanged = (psize == size and pmt == mtime_ns)
@@ -2408,6 +2440,7 @@ class SourceScanJob(threading.Thread):
                     log.info("%s: --limit %d reached", src.name, self.limit)
                     break
         finally:
+            conn_r.close()
             for _ in workers:
                 in_q.put(None)
             for w in workers:
