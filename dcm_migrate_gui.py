@@ -1,4 +1,8 @@
-"""dcm_migrate control panel — native Windows UI (tkinter, stdlib only).
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tomlkit>=0.13"]
+# ///
+"""dcm_migrate control panel — native Windows UI (tkinter).
 
 A thin cockpit over dcm_migrate.py: it never reimplements engine logic.
 Status comes from read-only queries against the state database; every action
@@ -32,7 +36,12 @@ import tomllib
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
+
+try:                       # comment-preserving TOML round-tripper (pure Python)
+    import tomlkit
+except ImportError:        # graceful: the structured editor degrades if it's absent
+    tomlkit = None
 
 # Mirrors of engine constants (dcm_migrate.py SECTION 2) — kept tiny on purpose.
 S_PENDING, S_SENT, S_SENT_WARN, S_FAILED_PERM, S_FAILED_RETRY, \
@@ -68,14 +77,14 @@ PROBLEM_HELP = {
     "H-DUP-CONFLICT": "Same SOPInstanceUID but different pixels across files. Choose a "
                       "diff_content_policy (block / regenerate-uid / keep-priority).",
     "H-PID-RULE-MISS": "A source with required ID rules had a study no rule matched. Add a "
-                       "rule or set a fallback (e.g. fuji.fallback_site).",
+                       "rule or set a fallback (e.g. id_generator.fallback_site).",
     "H-PID-COLLISION": "Two studies were assigned the SAME generated PatientID. Use a "
                        "fixed-width id_date_format (mmyy/yymm) to avoid ambiguity.",
     "H-PIXELLESS-ONLY": "A study has only pixel-less objects (no images). Review/exclude.",
     "H-NO-PATIENT-IDENTITY": "Study has neither PatientID nor PatientName. Set "
                              "no_identity_policy=placeholder, or exclude.",
-    "H-FUJI-NO-DATE": "Fuji study has no usable StudyDate for the ID. Enable "
-                      "fuji.date_from_mtime, or exclude.",
+    "H-IDGEN-NO-DATE": "A generated-ID study has no usable StudyDate for the ID. Enable "
+                       "id_generator.date_from_mtime, or exclude.",
     "W-CHARSET-GUESSED": "Text encoding was detected (not declared) and repaired to UTF-8. "
                          "Spot-check charset_suspects.csv before acking.",
     "W-CHARSET-LOSSY": "Some characters could not be represented and were replaced.",
@@ -90,7 +99,7 @@ PROBLEM_HELP = {
     "W-DUP-COLLISION-DROPPED": "Same-UID/diff-pixels: losing copies discarded (logged).",
     "W-PID-REWRITE": "A PatientID was rewritten by a rule. Review patient_id_preview.csv.",
     "W-IDENTITY-PLACEHOLDER": "A no-identity study got a synthesized placeholder ID.",
-    "W-FUJI-MTIME-DATE": "Fuji ID date came from the file's mtime (no valid StudyDate).",
+    "W-IDGEN-MTIME-DATE": "Generated-ID date came from the file's mtime (no valid StudyDate).",
     "W-COMPANION-ROUTED": "A companion-only study (SR/PR/OT/…) adopted a sibling's archive.",
     "W-GB-DECLARATION-FIXED": "GB bytes kept; only the (0008,0005) charset declaration fixed.",
     "I-NON-DICOM": "Non-DICOM files found and skipped (informational).",
@@ -156,6 +165,7 @@ class App:
         self.has_replace_me = False
         self.last_pending = 0                 # pending instances at last refresh (for ETA)
         self._eta_prev: tuple[float, int] | None = None
+        self._schema: dict | None = None      # cached engine config schema
         self._load_cfg()
 
         root.title(f"dcm_migrate — {cfg_path}")
@@ -197,6 +207,7 @@ class App:
         self.refresh_lbl.pack(side="left", padx=8)
         for text, fn in [("Refresh", self.refresh),
                          ("Config editor", self.open_config_editor),
+                         ("New workspace", self.new_workspace),
                          ("Edit raw TOML", lambda: os.startfile(self.cfg_path)),
                          ("Open report", self.open_report),
                          ("Open log dir", lambda: os.startfile(str(Path(self.db_path).parent)))]:
@@ -718,6 +729,23 @@ class App:
         except Exception as e:
             messagebox.showinfo("report", f"no report found: {e}")
 
+    def _get_schema(self) -> dict | None:
+        """Fetch the config schema from the engine (cached).  The GUI can't import
+        the engine (it may lack pydicom), so we shell out to `dcm_migrate schema`."""
+        if getattr(self, "_schema", None) is not None:
+            return self._schema
+        argv = engine_cmd(self.engine, self.cfg_path, "schema", [])
+        # `schema` ignores --config, but engine_cmd always inserts it — harmless
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=120,
+                               cwd=str(self.engine.parent))
+            self._schema = json.loads(r.stdout)
+            return self._schema
+        except Exception as e:
+            messagebox.showerror("config editor", f"could not load the config schema "
+                                                  f"from the engine:\n{e}")
+            return None
+
     def open_config_editor(self) -> None:
         if any(p.poll() is None for p in self.jobs.values()):
             if not messagebox.askyesno("config editor",
@@ -725,7 +753,14 @@ class App:
                                        "won't affect it, but saving a gate-affecting "
                                        "change disarms the gate for future runs. Open anyway?"):
                 return
-        ConfigEditor(self)
+        schema = self._get_schema()
+        if schema:
+            ConfigEditor(self, schema)
+
+    def new_workspace(self) -> None:
+        schema = self._get_schema()
+        if schema:
+            ConfigEditor(self, schema, new_workspace=True)
 
     def reload_config(self) -> None:
         """Re-read [general] paths after the editor saved (paths may have changed)."""
@@ -734,215 +769,145 @@ class App:
 
 
 # ---------------------------------------------------------------------------
-# Minimal TOML writer (stdlib has a reader, not a writer).  Handles exactly the
-# structure dcm_migrate configs use: nested tables, arrays of tables, scalar
-# and list-of-scalar values.  Unmodeled keys pass through verbatim from the
-# parsed dict, so custom rule arrays / folder maps survive an edit untouched.
+# Schema-driven, comment-preserving config editor.  The field/structure schema
+# comes from the engine (`dcm_migrate schema`); the document model is tomlkit,
+# so comments, ordering and formatting survive every edit — including adding,
+# removing and reordering whole sources / archives / rules.
 # ---------------------------------------------------------------------------
-def _toml_str(s: str) -> str:
-    if "'" not in s and "\n" not in s and "\r" not in s:
-        return f"'{s}'"                              # literal: backslashes safe (Windows paths)
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "") + '"'
-
-
-def _toml_key(k) -> str:
-    k = str(k)
-    return k if re.fullmatch(r"[A-Za-z0-9_-]+", k) else _toml_str(k)
-
-
-def _toml_val(v) -> str:
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, int) or isinstance(v, float):
-        return repr(v)
-    if isinstance(v, str):
-        return _toml_str(v)
-    if isinstance(v, list):
-        return "[" + ", ".join(_toml_val(x) for x in v) + "]"
-    raise TypeError(f"cannot serialize {type(v).__name__}")
-
-
-def _toml_emit(lines: list[str], path: str, tbl: dict, array: bool = False) -> None:
-    if path:
-        lines.append(f"[[{path}]]" if array else f"[{path}]")
-    subtables, arrays = [], []
-    for k, v in tbl.items():
-        if isinstance(v, dict):
-            subtables.append((k, v))
-        elif isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
-            arrays.append((k, v))
-        else:
-            lines.append(f"{_toml_key(k)} = {_toml_val(v)}")
-    for k, v in subtables:
-        lines.append("")
-        _toml_emit(lines, f"{path}.{_toml_key(k)}" if path else _toml_key(k), v)
-    for k, v in arrays:
-        for item in v:
-            lines.append("")
-            _toml_emit(lines, f"{path}.{_toml_key(k)}" if path else _toml_key(k), item, array=True)
-
-
-def _toml_dumps(data: dict) -> str:
-    lines = ["# written by dcm_migrate_gui config editor — comments are not preserved",
-             "# (see CONFIG.md for the annotated reference)", ""]
-    order = ["general", "server", "routing", "network", "source"]
-    keys = [k for k in order if k in data] + [k for k in data if k not in order]
-    for k in keys:
-        v = data[k]
-        if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
-            for item in v:
-                _toml_emit(lines, k, item, array=True)
-                lines.append("")
-        elif isinstance(v, dict):
-            _toml_emit(lines, k, v)
-            lines.append("")
-        else:
-            lines.append(f"{_toml_key(k)} = {_toml_val(v)}")
-    return "\n".join(lines).rstrip() + "\n"
-
-
-# field layout: (key, kind, options|None, help).  kind: str|int|float|bool|combo|csv|lines
-_F_GENERAL = [
-    ("db_path", "str", None, ""), ("report_dir", "str", None, ""),
-    ("sidecar_dir", "str", None, ""), ("log_file", "str", None, ""),
-    ("pause_file", "str", None, ""),
-    ("scan_backend", "combo", ["auto", "threads", "processes"], ""),
-    ("sidecar_compress", "bool", None, ""), ("uid_root", "str", None, ""),
-    ("diff_content_policy", "combo", ["block", "regenerate-uid", "keep-priority"], "same UID / diff pixels"),
-    ("no_identity_policy", "combo", ["block", "placeholder"], "no PatientID + no name"),
-]
-_F_SERVER = [("host", "str", None, ""), ("max_pdu", "int", None, "bytes"),
-             ("acse_timeout", "int", None, "s"), ("dimse_timeout", "int", None, "s"),
-             ("network_timeout", "int", None, "s")]
-_F_NETWORK = [
-    ("max_associations", "int", None, ""), ("rate_limit_mbit", "float", None, "0 = unlimited"),
-    ("active_hours", "str", None, '"" = always'), ("active_days", "csv", None, ""),
-    ("instances_per_association", "int", None, ""), ("backoff_initial_s", "float", None, "s"),
-    ("backoff_max_s", "float", None, "s"), ("max_instance_retries", "int", None, "1 = no retry"),
-    ("circuit_breaker_failures", "int", None, "0 clamps to 1!"),
-    ("memory_budget_mb", "int", None, ""), ("skip_existing_studies", "bool", None, ""),
-]
-_F_SOURCE = [
-    ("name", "str", None, ""), ("adapter", "combo", ["filetree", "orthanc"], ""),
-    ("roots", "lines", None, "one path per line"), ("calling_aet", "str", None, ""),
-    ("priority", "int", None, "lower wins dups"),
-    ("charset_policy", "combo", ["utf8", "keep-gb", "keep"], ""),
-    ("charset_source", "str", None, "auto or a codec"),
-    ("charset_detect_order", "csv", None, ""), ("caret_repair", "bool", None, ""),
-    ("translit_cyrillic", "bool", None, ""), ("is_fix_tags", "csv", None, "IS tags -> int"),
-    ("max_readers", "int", None, ""), ("exclude_dirs", "csv", None, ""),
-    ("exclude_file_globs", "csv", None, ""), ("file_globs", "csv", None, "empty = all"),
-    ("pid_rules_mode", "combo", ["off", "optional", "required"], ""),
-    ("index_db", "str", None, "orthanc index"),
-]
-_F_FUJI = [("enabled", "bool", None, ""), ("sites", "csv", None, ""),
-           ("fallback_site", "str", None, '"" => blocker'), ("date_from_mtime", "bool", None, ""),
-           ("original_id", "combo", ["drop", "suffix"], ""),
-           ("id_date_format", "combo", ["myy", "mmyy", "yymm"], "")]
-
-
 class ConfigEditor:
-    """Schema-driven editor over the TOML.  [network] is colour-coded SAFE
-    (a save needs only a send restart); every other section is GATE-AFFECTING
-    (a save disarms the gate) and is locked until the user opts in.  Saves are
-    validated by the engine's `checkconfig` on a temp copy and back up the
-    original before writing — the on-disk config is never left invalid."""
-
-    def __init__(self, app: "App"):
+    def __init__(self, app: "App", schema: dict, new_workspace: bool = False):
         self.app = app
         self.path = Path(app.cfg_path)
-        try:
-            self.data = tomllib.loads(self.path.read_bytes().decode("utf-8"))
-        except Exception as e:
-            messagebox.showerror("config editor", f"cannot parse {self.path}:\n{e}")
+        self.schema = schema
+        if tomlkit is None:
+            messagebox.showinfo(
+                "config editor",
+                "The structured editor needs the pure-Python 'tomlkit' package.\n\n"
+                "Launch via dcm_migrate_gui.cmd or `uv run dcm_migrate_gui.py` (which "
+                "installs it automatically), or `pip install tomlkit`.\n\n"
+                "Meanwhile, use 'Edit raw TOML'.")
             return
-        self.orig_text = self.path.read_bytes().decode("utf-8")
-        self.fields: list = []      # dicts: path, raw(), get(), initial, groups
+        try:
+            text = "" if new_workspace else self.path.read_text(encoding="utf-8")
+            self.doc = tomlkit.parse(text)
+        except Exception as e:
+            messagebox.showerror("config editor", f"cannot read/parse {self.path}:\n{e}")
+            return
+        self.new_workspace = new_workspace
+        self.sec_by_key = {s["key"]: s for s in schema["sections"]}
+        if new_workspace:
+            self._seed()
+        else:
+            self._migrate_legacy()
+        self.orig_nn = self._nn_of_doc()          # baseline for gate-disarm detection
+        self.binders: list = []
         self.gate_widgets: list = []
         self.win = tk.Toplevel(app.root)
-        self.win.title(f"Config editor — {self.path.name}")
-        self.win.geometry("820x860")
+        self.win.title(("New workspace — " if new_workspace else "Config editor — ") + self.path.name)
+        self.win.geometry("900x900")
+        self.gate_var = tk.BooleanVar(value=new_workspace)   # a fresh workspace is all-editable
         self._build()
 
-    # ---- data-tree helpers -------------------------------------------------
-    def _get(self, path):
-        cur = self.data
-        for k in path:
-            if isinstance(k, int):
-                if not isinstance(cur, list) or k >= len(cur):
-                    return None
-                cur = cur[k]
-            else:
-                if not isinstance(cur, dict) or k not in cur:
-                    return None
-                cur = cur[k]
-        return cur
-
+    # ---- helpers -----------------------------------------------------------
     @staticmethod
-    def _set(work, path, val):
-        cur = work
-        for k in path[:-1]:
-            cur = cur[k] if isinstance(k, int) else cur.setdefault(k, {})
-        cur[path[-1]] = val
+    def _nn(d: dict) -> str:
+        return json.dumps({k: v for k, v in d.items() if k != "network"}, sort_keys=True, default=str)
 
-    @staticmethod
-    def _nn(d) -> str:
-        return json.dumps({k: v for k, v in d.items() if k != "network"},
-                          sort_keys=True, default=str)
+    def _nn_of_doc(self) -> str:
+        return self._nn(tomllib.loads(tomlkit.dumps(self.doc)))
+
+    def _default_for(self, field):
+        d = field["default"]
+        if d is not None:
+            return d
+        return {"csv": [], "lines": []}.get(field["kind"], "")
+
+    def _defaults_table(self, fields):
+        t = tomlkit.table()
+        for f in fields:
+            t[f["name"]] = self._default_for(f)
+        return t
+
+    def _seed(self):
+        S = self.sec_by_key
+        self.doc["general"] = self._defaults_table(S["general"]["fields"])
+        srv = self._defaults_table(S["server"]["fields"])
+        dchild = next(c for c in S["server"]["children"] if c["key"] == "destinations")
+        dests = tomlkit.table()
+        dests["other"] = self._defaults_table(dchild["value_fields"])
+        srv["destinations"] = dests
+        self.doc["server"] = srv
+        self.doc["network"] = self._defaults_table(S["network"]["fields"])
+        rt = self._defaults_table(S["routing"]["fields"])
+        # cover the engine's default modality groups so the skeleton validates;
+        # every group falls back to the 'other' archive until the user adds more.
+        rt["precedence"] = ["ct", "xray", "xa", "other"]
+        self.doc["routing"] = rt
+        src = self._defaults_table(S["source"]["fields"])
+        src["name"] = "source1"
+        src["roots"] = ["REPLACE_ME"]        # roots must be non-empty; user fills it
+        aot = tomlkit.aot(); aot.append(src)
+        self.doc["source"] = aot
+
+    def _migrate_legacy(self):
+        """Rename the legacy [source.fuji] block to [source.id_generator] so the
+        schema-driven form finds it.  tomlkit preserves the block's contents and
+        comments across the rename; the engine still accepts either key."""
+        for src in self.doc.get("source", []) or []:
+            if "fuji" in src and "id_generator" not in src:
+                src["id_generator"] = src.pop("fuji")
+
+    def _ensure_table(self, parent, key):
+        if key not in parent:
+            parent[key] = tomlkit.table()
+        return parent[key]
+
+    def _ensure_aot(self, parent, key):
+        if key not in parent:
+            parent[key] = tomlkit.aot()
+        return parent[key]
 
     # ---- widgets -----------------------------------------------------------
-    def _section(self, parent, title, gate):
-        bg = "#7a3b00" if gate else "#1d5c2d"
-        tag = ("GATE-AFFECTING — saving disarms the gate (re-analyze & re-arm)"
-               if gate else "SAFE — a save needs only a send restart")
-        tk.Label(parent, text=f"  {title}    —    {tag}", bg=bg, fg="white", anchor="w",
-                 font=("Segoe UI", 9, "bold")).pack(fill="x", pady=(12, 2))
-        fr = ttk.Frame(parent); fr.pack(fill="x")
-        return fr
-
-    def _row(self, parent, label, kind, value, options, help, gate):
-        """Returns (raw, get): raw() is a cheap change-detection snapshot of the
-        widget; get() is the typed value (may raise ValueError on bad numbers)."""
+    def _row(self, parent, field, container, gate, label=None):
+        kind, name = field["kind"], field["name"]
+        cur = container.get(name, self._default_for(field))
         fr = ttk.Frame(parent); fr.pack(fill="x", padx=(16, 8), pady=1)
-        ttk.Label(fr, text=label, width=24, anchor="w").pack(side="left")
+        ttk.Label(fr, text=label or name, width=24, anchor="w").pack(side="left")
         if kind == "bool":
-            var = tk.BooleanVar(value=bool(value))
+            var = tk.BooleanVar(value=bool(cur))
             w = ttk.Checkbutton(fr, variable=var); w.pack(side="left")
-            raw = lambda: var.get(); get = lambda: bool(var.get())
-        elif kind == "combo":
-            var = tk.StringVar(value="" if value is None else str(value))
-            w = ttk.Combobox(fr, textvariable=var, values=options or [], width=26, state="readonly")
-            w.pack(side="left")
-            raw = lambda: var.get(); get = lambda: var.get()
+            get = lambda: bool(var.get())
+        elif kind == "enum":
+            var = tk.StringVar(value="" if cur is None else str(cur))
+            w = ttk.Combobox(fr, textvariable=var, values=field.get("choices") or [],
+                             width=24, state="readonly"); w.pack(side="left")
+            get = lambda: var.get()
         elif kind == "csv":
-            var = tk.StringVar(value=", ".join(str(x) for x in (value or [])))
+            var = tk.StringVar(value=", ".join(str(x) for x in (cur or [])))
             w = ttk.Entry(fr, textvariable=var); w.pack(side="left", fill="x", expand=True)
-            raw = lambda: var.get()
             get = lambda: [x.strip() for x in var.get().split(",") if x.strip()]
         elif kind == "lines":
-            w = tk.Text(fr, height=3, width=50)
-            w.insert("1.0", "\n".join(str(x) for x in (value or [])))
+            w = tk.Text(fr, height=3, width=48)
+            w.insert("1.0", "\n".join(str(x) for x in (cur or [])))
             w.pack(side="left", fill="x", expand=True)
-            raw = lambda: w.get("1.0", "end")
             get = lambda: [x.strip() for x in w.get("1.0", "end").splitlines() if x.strip()]
         elif kind in ("int", "float"):
-            var = tk.StringVar(value="" if value is None else str(value))
+            var = tk.StringVar(value="" if cur is None else str(cur))
             w = ttk.Entry(fr, textvariable=var, width=16); w.pack(side="left")
             conv = int if kind == "int" else float
-            raw = lambda: var.get()
-            def get(_v=var, _c=conv, _l=label):
+            def get(_v=var, _c=conv, _l=(label or name)):
                 s = _v.get().strip()
                 try:
                     return _c(s)
                 except ValueError:
                     raise ValueError(f"{_l}: expected {'an integer' if _c is int else 'a number'}, got {s!r}")
-        else:
-            var = tk.StringVar(value="" if value is None else str(value))
+        else:  # str / path
+            var = tk.StringVar(value="" if cur is None else str(cur))
             w = ttk.Entry(fr, textvariable=var); w.pack(side="left", fill="x", expand=True)
-            raw = lambda: var.get(); get = lambda: var.get()
-        if help:
-            ttk.Label(fr, text=help, foreground="#999").pack(side="left", padx=6)
-        if isinstance(value, str) and "REPLACE_ME" in value:
+            get = lambda: var.get()
+        if field.get("help"):
+            ttk.Label(fr, text=field["help"], foreground="#999").pack(side="left", padx=6)
+        if isinstance(cur, str) and "REPLACE_ME" in cur:
             try:
                 w.configure(foreground="#d33")
             except tk.TclError:
@@ -950,23 +915,62 @@ class ConfigEditor:
             tk.Label(fr, text="⚠ set me", fg="#d33").pack(side="left", padx=4)
         if gate:
             self.gate_widgets.append(w)
-        return raw, get
+        self.binders.append(lambda _c=container, _n=name, _g=get: _c.__setitem__(_n, _g()))
 
-    def _reg(self, parent, path, kind, options, help, gate, label=None):
-        raw, get = self._row(parent, label or path[-1], kind, self._get(path), options, help, gate)
-        self.fields.append({"path": path, "raw": raw, "get": get,
-                            "initial": raw(), "groups": False})
+    def _section_header(self, parent, label, gate):
+        bg = "#7a3b00" if gate else "#1d5c2d"
+        tag = ("GATE-AFFECTING — saving disarms the gate" if gate
+               else "SAFE — retune without disarming")
+        tk.Label(parent, text=f"  {label}   —   {tag}", bg=bg, fg="white", anchor="w",
+                 font=("Segoe UI", 9, "bold")).pack(fill="x", pady=(12, 2))
 
+    def _titlebar(self, parent, text, on_remove=None, on_up=None, on_down=None, color="#446"):
+        bar = tk.Frame(parent, bg=color); bar.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(bar, text=text, bg=color, fg="white", anchor="w").pack(side="left", padx=4)
+        if on_down:
+            b = ttk.Button(bar, text="↓", width=2, command=lambda: self._struct(on_down)); b.pack(side="right")
+            if self.gate_var.get() is False: b.state(["disabled"])
+        if on_up:
+            b = ttk.Button(bar, text="↑", width=2, command=lambda: self._struct(on_up)); b.pack(side="right")
+            if self.gate_var.get() is False: b.state(["disabled"])
+        if on_remove:
+            b = ttk.Button(bar, text="remove", width=7, command=lambda: self._struct(on_remove)); b.pack(side="right", padx=2)
+            if self.gate_var.get() is False: b.state(["disabled"])
+        return bar
+
+    # ---- structural mutation (flush widgets -> doc, mutate, rebuild) -------
+    def _struct(self, mutate):
+        try:
+            self._flush()
+        except ValueError as e:
+            messagebox.showerror("invalid input", str(e)); return
+        mutate()
+        self._rebuild()
+
+    def _flush(self):
+        for b in self.binders:
+            b()
+
+    def _add_button(self, parent, text, mutate):
+        b = ttk.Button(parent, text=text, command=lambda: self._struct(mutate))
+        b.pack(anchor="w", padx=16, pady=2)
+        if not self.gate_var.get():
+            b.state(["disabled"])
+        self.gate_widgets.append(b)
+
+    # ---- rendering ---------------------------------------------------------
     def _build(self):
+        for c in list(self.win.children.values()):
+            c.destroy()
+        self.binders = []; self.gate_widgets = []
+
         top = ttk.Frame(self.win, padding=6); top.pack(fill="x")
-        self.gate_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, variable=self.gate_var, command=self._toggle_gate,
-                        text="Enable editing of GATE-AFFECTING fields "
-                             "(saving them disarms the gate — re-analyze & re-arm)").pack(anchor="w")
+                        text="Enable editing of GATE-AFFECTING fields/structure "
+                             "(saving disarms the gate — re-analyze & re-arm)").pack(anchor="w")
         ttk.Label(top, foreground="#999",
-                  text="green = [network] (safe, send-restart only)   ·   "
-                       "amber = content config (disarms the gate on save)   ·   "
-                       "custom ID rules / folder maps are preserved; edit those via 'Edit raw TOML'").pack(anchor="w")
+                  text="green = [network] (safe)   ·   amber = content config (disarms on save)   ·   "
+                       "comments & formatting are preserved on save (tomlkit)").pack(anchor="w")
 
         outer = ttk.Frame(self.win); outer.pack(fill="both", expand=True)
         canvas = tk.Canvas(outer, borderwidth=0, highlightthickness=0)
@@ -974,86 +978,136 @@ class ConfigEditor:
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y"); canvas.pack(side="left", fill="both", expand=True)
         body = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=body, anchor="nw", width=780)
+        canvas.create_window((0, 0), window=body, anchor="nw", width=850)
         body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         wheel = lambda e: canvas.yview_scroll(int(-e.delta / 120), "units")
         canvas.bind_all("<MouseWheel>", wheel)
         self.win.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
-        fr = self._section(body, "[general]", gate=True)
-        for k, kind, opt, h in _F_GENERAL:
-            self._reg(fr, ["general", k], kind, opt, h, gate=True)
-
-        fr = self._section(body, "[server]", gate=True)
-        for k, kind, opt, h in _F_SERVER:
-            self._reg(fr, ["server", k], kind, opt, h, gate=True)
-        dests = self._get(["server", "destinations"]) or {}
-        for g in dests:
-            ttk.Label(fr, text=f"  destinations.{g}", foreground="#66a",
-                      padding=(16, 2, 0, 0)).pack(anchor="w")
-            self._reg(fr, ["server", "destinations", g, "port"], "int", None, "", True, label=f"  {g}.port")
-            self._reg(fr, ["server", "destinations", g, "called_aet"], "str", None, "", True, label=f"  {g}.called_aet")
-
-        fr = self._section(body, "[routing]", gate=True)
-        groups = {k: v for k, v in (self._get(["routing"]) or {}).items()
-                  if k not in ("precedence", "companion") and isinstance(v, list)}
-        rowf = ttk.Frame(fr); rowf.pack(fill="x", padx=(16, 8), pady=1)
-        ttk.Label(rowf, text="groups (name = MOD,MOD)", width=24, anchor="w").pack(side="left")
-        gtext = tk.Text(rowf, height=max(3, len(groups)), width=50)
-        gtext.insert("1.0", "\n".join(f"{k} = {', '.join(v)}" for k, v in groups.items()))
-        gtext.pack(side="left", fill="x", expand=True)
-        self.gate_widgets.append(gtext)
-        self.fields.append({"path": ("routing", "__groups__"),
-                            "raw": lambda _w=gtext: _w.get("1.0", "end"),
-                            "get": lambda _w=gtext: _w, "initial": gtext.get("1.0", "end"),
-                            "groups": True})
-        self._reg(fr, ["routing", "precedence"], "csv", None, "", True)
-        self._reg(fr, ["routing", "companion"], "csv", None, "opt-in; [] disables", True)
-
-        fr = self._section(body, "[network]", gate=False)
-        for k, kind, opt, h in _F_NETWORK:
-            self._reg(fr, ["network", k], kind, opt, h, gate=False)
-
-        for i, src in enumerate(self._get(["source"]) or []):
-            name = src.get("name", f"#{i}")
-            fr = self._section(body, f"[[source]]  {name}", gate=True)
-            for k, kind, opt, h in _F_SOURCE:
-                self._reg(fr, ["source", i, k], kind, opt, h, gate=True)
-            if "fuji" in src:
-                ttk.Label(fr, text="  [source.fuji]", foreground="#66a",
-                          padding=(16, 2, 0, 0)).pack(anchor="w")
-                for k, kind, opt, h in _F_FUJI:
-                    self._reg(fr, ["source", i, "fuji", k], kind, opt, h, gate=True, label=f"  fuji.{k}")
-                nmap = len(src.get("fuji", {}).get("folder_site_map", {}) or {})
-                if nmap:
-                    ttk.Label(fr, text=f"  ({nmap} folder→site mapping(s) preserved; "
-                                       f"edit via 'Edit raw TOML')", foreground="#999",
-                              padding=(16, 0, 0, 0)).pack(anchor="w")
-            nrules = len(src.get("patient_id_rule", []) or [])
-            if nrules:
-                ttk.Label(fr, text=f"  ({nrules} patient_id_rule(s) preserved; "
-                                   f"edit via 'Edit raw TOML')", foreground="#999",
-                          padding=(16, 0, 0, 2)).pack(anchor="w")
+        for sec in self.schema["sections"]:
+            self._render_section(body, sec)
 
         bar = ttk.Frame(self.win, padding=6); bar.pack(fill="x")
         ttk.Button(bar, text="Validate", command=self._on_validate).pack(side="left")
         ttk.Button(bar, text="Save (backup + write)", command=self._on_save).pack(side="left", padx=6)
-        ttk.Button(bar, text="Reload from disk", command=self._reload).pack(side="left")
+        if not self.new_workspace:
+            ttk.Button(bar, text="Reload from disk", command=self._reload).pack(side="left")
         ttk.Button(bar, text="Close", command=self.win.destroy).pack(side="right")
         self._toggle_gate()
 
-    def _apply_groups(self, work, widget):
-        rt = work.setdefault("routing", {})
-        for k in [k for k in list(rt) if k not in ("precedence", "companion")]:
-            del rt[k]
-        for line in widget.get("1.0", "end").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if "=" not in line:
-                raise ValueError(f"routing group line needs '=':  {line!r}")
-            name, rest = line.split("=", 1)
-            rt[name.strip()] = [m.strip() for m in rest.split(",") if m.strip()]
+    def _render_section(self, parent, sec):
+        self._section_header(parent, sec["label"], sec["gate"])
+        card = sec["cardinality"]
+        if card == "table":
+            container = self._ensure_table(self.doc, sec["key"])
+            for f in sec["fields"]:
+                self._row(parent, f, container, sec["gate"])
+            for child in sec.get("children", []):
+                if child["cardinality"] == "table_map":
+                    self._render_table_map(parent, child, container)
+            if "groups" in sec:
+                self._render_groups(parent, container, sec["groups"])
+        elif card == "array_table":
+            self._render_array_table(parent, sec, self.doc, top=True)
+
+    def _render_table_map(self, parent, child, parent_container):
+        container = self._ensure_table(parent_container, child["key"])
+        ttk.Label(parent, text=f"  {child['label']}", foreground="#66a").pack(anchor="w", padx=12)
+        for k in list(container):
+            self._titlebar(parent, f"{child['key']}.{k}",
+                           on_remove=lambda kk=k: container.__delitem__(kk))
+            for f in child["value_fields"]:
+                self._row(parent, f, container[k], child["gate"], label=f"  {f['name']}")
+        def add():
+            key = simpledialog.askstring(child["key"], f"New {child.get('key_hint', 'key')}:", parent=self.win)
+            if key:
+                container[key] = self._defaults_table(child["value_fields"])
+        self._add_button(parent, f"+ add {child['key'][:-1] if child['key'].endswith('s') else child['key']}", add)
+
+    def _render_groups(self, parent, routing, meta):
+        reserved = {"precedence", "companion"}
+        groups = [k for k in routing if k not in reserved and isinstance(routing.get(k), list)]
+        ttk.Label(parent, text=f"  {meta['label']}", foreground="#66a").pack(anchor="w", padx=12)
+        for g in groups:
+            fr = ttk.Frame(parent); fr.pack(fill="x", padx=(16, 8), pady=1)
+            ttk.Label(fr, text=f"  {g}", width=24, anchor="w").pack(side="left")
+            var = tk.StringVar(value=", ".join(str(x) for x in routing.get(g, [])))
+            w = ttk.Entry(fr, textvariable=var); w.pack(side="left", fill="x", expand=True)
+            rm = ttk.Button(fr, text="remove", width=7, command=lambda gg=g: self._struct(lambda: routing.__delitem__(gg)))
+            rm.pack(side="left", padx=2)
+            self.gate_widgets += [w, rm]
+            self.binders.append(lambda _r=routing, _g=g, _v=var:
+                                _r.__setitem__(_g, [x.strip() for x in _v.get().split(",") if x.strip()]))
+        def add():
+            key = simpledialog.askstring("routing group", f"New {meta.get('key_hint', 'group')}:", parent=self.win)
+            if key:
+                routing[key] = []
+        self._add_button(parent, "+ add group", add)
+
+    def _render_array_table(self, parent, sec, parent_container, top=False):
+        container = self._ensure_aot(parent_container, sec["key"])
+        n = len(container)
+        for i in range(n):
+            item = container[i]
+            kf = sec.get("key_field")
+            title = f"{sec['key']}[{i}]" + (f"  {item.get(kf, '')}" if kf else "")
+            def mk_remove(idx=i):
+                return lambda: container.__delitem__(idx)
+            def mk_up(idx=i):
+                return lambda: container.body.insert(idx - 1, container.body.pop(idx))
+            def mk_down(idx=i):
+                return lambda: container.body.insert(idx + 1, container.body.pop(idx))
+            self._titlebar(parent, title, on_remove=mk_remove(),
+                           on_up=mk_up() if i > 0 else None,
+                           on_down=mk_down() if i < n - 1 else None, color="#356")
+            for f in sec["fields"]:
+                self._row(parent, f, item, sec["gate"])
+            for child in sec.get("children", []):
+                if child["cardinality"] == "opt_table":
+                    self._render_opt_table(parent, child, item)
+                elif child["cardinality"] == "array_table":
+                    ttk.Label(parent, text=f"  {child['label']}", foreground="#66a").pack(anchor="w", padx=12)
+                    self._render_array_table(parent, child, item)
+        self._add_button(parent, f"+ add {sec['key']}",
+                         lambda: container.append(self._new_item(sec)))
+
+    def _new_item(self, sec):
+        t = self._defaults_table(sec["fields"])
+        kf = sec.get("key_field")
+        if kf and not t.get(kf):
+            t[kf] = f"{sec['key']}{len(self.doc.get(sec['key'], []))}"
+        return t
+
+    def _render_opt_table(self, parent, child, item):
+        if child["key"] in item:
+            self._titlebar(parent, child["label"], on_remove=lambda: item.__delitem__(child["key"]), color="#454")
+            block = item[child["key"]]
+            for f in child["fields"]:
+                self._row(parent, f, block, child["gate"], label=f"  {f['name']}")
+            for gc in child.get("children", []):
+                if gc["cardinality"] == "scalar_map":
+                    self._render_scalar_map(parent, gc, block)
+        else:
+            self._add_button(parent, f"+ add {child['label']}",
+                             lambda: item.__setitem__(child["key"], self._defaults_table(child["fields"])))
+
+    def _render_scalar_map(self, parent, child, block):
+        container = self._ensure_table(block, child["key"])
+        ttk.Label(parent, text=f"    {child['label']}", foreground="#66a").pack(anchor="w", padx=16)
+        for k in list(container):
+            fr = ttk.Frame(parent); fr.pack(fill="x", padx=(24, 8), pady=1)
+            ttk.Label(fr, text=f"  {k}", width=28, anchor="w").pack(side="left")
+            var = tk.StringVar(value=str(container.get(k, "")))
+            w = ttk.Entry(fr, textvariable=var, width=16); w.pack(side="left")
+            rm = ttk.Button(fr, text="remove", width=7, command=lambda kk=k: self._struct(lambda: container.__delitem__(kk)))
+            rm.pack(side="left", padx=2)
+            self.gate_widgets += [w, rm]
+            self.binders.append(lambda _c=container, _k=k, _v=var: _c.__setitem__(_k, _v.get()))
+        def add():
+            key = simpledialog.askstring(child["key"], f"New {child.get('key_hint', 'key')}:", parent=self.win)
+            if key:
+                container[key] = ""
+        self._add_button(parent, f"+ add mapping", add)
 
     def _toggle_gate(self):
         on = self.gate_var.get()
@@ -1061,111 +1115,17 @@ class ConfigEditor:
             try:
                 if isinstance(w, ttk.Combobox):
                     w.configure(state="readonly" if on else "disabled")
+                elif isinstance(w, ttk.Button):
+                    w.state(["!disabled"] if on else ["disabled"])
                 else:
                     w.configure(state="normal" if on else "disabled")
             except tk.TclError:
                 pass
 
-    def _changed_fields(self):
-        return [f for f in self.fields if f["raw"]() != f["initial"]]
-
-    def _collect(self):
-        """Build the target config (= on-disk config + only the fields the user
-        actually changed) and the text to write.  Prefer a surgical rewrite that
-        preserves comments/formatting; fall back to full regeneration only if the
-        surgical result can't be proven identical to the intended config."""
-        work = copy.deepcopy(self.data)
-        changed = self._changed_fields()
-        for f in changed:
-            if f["groups"]:
-                self._apply_groups(work, f["get"]())
-            else:
-                self._set(work, f["path"], f["get"]())     # may raise ValueError
-
-        groups_changed = any(f["groups"] for f in changed)
-        text = None
-        if not groups_changed:
-            text = self._surgical(self.orig_text, [f for f in changed if not f["groups"]])
-        if text is not None:
-            # safety gate: the surgically-edited text must parse to exactly `work`
-            try:
-                if tomllib.loads(text) != work:
-                    text = None
-            except Exception:
-                text = None
-        preserved = text is not None
-        if text is None:
-            text = _toml_dumps(work)                        # regeneration (comments lost)
-        return work, text, preserved
-
-    @staticmethod
-    def _split_value_comment(rhs: str):
-        """Split a TOML value's RHS into (value, trailing-comment) honoring quotes."""
-        in_s = in_d = False
-        for i, ch in enumerate(rhs):
-            if ch == "'" and not in_d:
-                in_s = not in_s
-            elif ch == '"' and not in_s:
-                in_d = not in_d
-            elif ch == "#" and not in_s and not in_d:
-                return rhs[:i].rstrip(), rhs[i:]
-        return rhs.rstrip(), ""
-
-    def _surgical(self, text: str, changed):
-        """Rewrite only the lines for `changed` fields, preserving everything
-        else (comments, order, spacing).  Returns new text, or None if a target
-        line/table couldn't be located (caller then regenerates)."""
-        targets = {}                       # (ctx_tuple, key) -> new value object
-        for f in changed:
-            path = f["path"]
-            targets[(tuple(path[:-1]), path[-1])] = f["get"]()
-        lines = text.splitlines(keepends=False)
-        found = set()
-        src_idx = -1
-        ctx: tuple = ()
-        header_line = {}                   # ctx_tuple -> line index of its header
-        assign_re = re.compile(r"^(\s*)([A-Za-z0-9_-]+)(\s*=\s*)(.*)$")
-        for n, line in enumerate(lines):
-            s = line.strip()
-            if s.startswith("[["):
-                name = s[2:s.index("]]")].strip()
-                if name == "source":
-                    src_idx += 1; ctx = ("source", src_idx)
-                elif name.startswith("source."):
-                    ctx = ("source", src_idx) + tuple(name[len("source."):].split("."))
-                else:
-                    ctx = tuple(name.split("."))
-                header_line[ctx] = n
-                continue
-            if s.startswith("[") and s.endswith("]"):
-                name = s[1:-1].strip()
-                if name.startswith("source."):
-                    ctx = ("source", src_idx) + tuple(name[len("source."):].split("."))
-                else:
-                    ctx = tuple(name.split("."))
-                header_line[ctx] = n
-                continue
-            m = assign_re.match(line)
-            if not m:
-                continue
-            key = m.group(2)
-            if (ctx, key) in targets:
-                _val, comment = self._split_value_comment(m.group(4))
-                newval = _toml_val(targets[(ctx, key)])
-                tail = (" " + comment) if comment else ""
-                lines[n] = f"{m.group(1)}{key}{m.group(3)}{newval}{tail}"
-                found.add((ctx, key))
-        # any target not present as an existing line: append under its table header
-        for (tctx, key), val in targets.items():
-            if (tctx, key) in found:
-                continue
-            if tctx not in header_line:
-                return None                # can't place it safely -> regenerate
-            hl = header_line[tctx]
-            lines.insert(hl + 1, f"{key} = {_toml_val(val)}")
-            # shift later header indices we might still append to
-            header_line = {c: (i + 1 if i > hl else i) for c, i in header_line.items()}
-        return "\n".join(lines) + "\n"
+    # ---- validate / save ---------------------------------------------------
+    def _dump(self) -> str:
+        self._flush()
+        return tomlkit.dumps(self.doc)
 
     def _validate_text(self, text):
         tmp = Path(tempfile.gettempdir()) / f"dcm_cfg_check_{os.getpid()}.toml"
@@ -1185,70 +1145,65 @@ class ConfigEditor:
 
     def _on_validate(self):
         try:
-            _work, text, preserved = self._collect()
+            text = self._dump()
         except ValueError as e:
             messagebox.showerror("invalid input", str(e)); return
         ok, out = self._validate_text(text)
-        note = ("\n\n(comments/formatting preserved)" if preserved else
-                "\n\n(note: this change regenerates the file — comments not preserved)")
         (messagebox.showinfo if ok else messagebox.showerror)(
-            "validation " + ("passed" if ok else "FAILED"),
-            (out or ("ok" if ok else "unknown error")) + (note if ok else ""))
+            "validation " + ("passed" if ok else "FAILED"), out or ("ok" if ok else "unknown error"))
 
     def _on_save(self):
         try:
-            work, text, preserved = self._collect()
+            text = self._dump()
         except ValueError as e:
             messagebox.showerror("invalid input", str(e)); return
-        if not self._changed_fields():
-            messagebox.showinfo("no changes", "nothing changed"); return
         ok, out = self._validate_text(text)
         if not ok:
             messagebox.showerror("validation failed",
                                  "The engine rejected this config — NOT saved:\n\n" + out)
             return
-        disarms = self._nn(work) != self._nn(self.data)
-        comment_warn = ("" if preserved else
-                        "\n\nNOTE: this edit regenerates the file — inline comments "
-                        "will NOT be preserved (the .bak keeps your commented copy).")
-        if disarms and not messagebox.askyesno(
+        target = self.path
+        if self.new_workspace:
+            chosen = filedialog.asksaveasfilename(
+                parent=self.win, defaultextension=".toml", initialfile="migration.toml",
+                filetypes=[("TOML", "*.toml")], title="Save new workspace config as")
+            if not chosen:
+                return
+            target = Path(chosen)
+        disarms = (not target.exists()) or (self._nn(tomllib.loads(text)) != self.orig_nn)
+        if disarms and target.exists() and not messagebox.askyesno(
                 "disarm the gate?",
                 "These edits change content config (not just [network]).\n\n"
-                "Saving DISARMS the send gate — you must re-run analyze and "
-                "approve --arm before the next send.\n\nSave anyway?" + comment_warn,
-                icon="warning"):
-            return
-        if not disarms and not preserved and not messagebox.askyesno(
-                "regenerate file?", "Saving will regenerate the file and drop inline "
-                "comments (the .bak keeps your commented copy). Continue?"):
+                "Saving DISARMS the send gate — re-run analyze and approve --arm "
+                "before the next send.\n\nSave anyway?", icon="warning"):
             return
         try:
-            bak = self.path.with_name(self.path.name + ".bak")
-            shutil.copy2(self.path, bak)
-            self.path.write_text(text, encoding="utf-8")
+            if target.exists():
+                shutil.copy2(target, target.with_name(target.name + ".bak"))
+            target.write_text(text, encoding="utf-8")
         except Exception as e:
             messagebox.showerror("write failed", str(e)); return
-        self.data = work
-        self.orig_text = text
-        for f in self.fields:            # new baseline for further edits this session
-            f["initial"] = f["raw"]()
-        self.app.reload_config()
-        kind = ("gate DISARMED — re-analyze & re-arm before send" if disarms
-                else "network-only change — just restart send to apply")
-        cmt = "comments preserved" if preserved else "file regenerated (comments dropped; see .bak)"
-        self.app._console(f"[config saved -> {self.path.name} (backup {bak.name}); {kind}; {cmt}]\n",
+        self.path = target
+        self.orig_nn = self._nn(tomllib.loads(text))
+        self.new_workspace = False
+        if str(target) == str(self.app.cfg_path):
+            self.app.reload_config()
+        note = ("gate DISARMED — re-analyze & re-arm" if disarms
+                else "network-only — restart send to apply")
+        self.app._console(f"[config saved -> {target.name} (comments preserved); {note}]\n",
                           "warn" if disarms else "ok")
-        messagebox.showinfo("saved", f"Saved and validated.\nBackup: {bak.name}\n\n{kind}.\n{cmt}.")
+        messagebox.showinfo("saved", f"Saved and validated: {target.name}\n\n{note}.\n"
+                                     f"(comments and formatting preserved)")
 
     def _reload(self):
         try:
-            self.orig_text = self.path.read_bytes().decode("utf-8")
-            self.data = tomllib.loads(self.orig_text)
+            self.doc = tomlkit.parse(self.path.read_text(encoding="utf-8"))
+            self.orig_nn = self._nn_of_doc()
         except Exception as e:
             messagebox.showerror("reload", str(e)); return
-        for child in list(self.win.children.values()):
-            child.destroy()
-        self.fields.clear(); self.gate_widgets.clear()
+        self._build()
+
+    def _rebuild(self):
         self._build()
 
 

@@ -39,7 +39,12 @@ Other commands: `probe` (inspect files classified non-DICOM/error), `dup-audit`
 (review duplicate groups), `xcheck-orthanc`, `export-mapping` (CSV of ID/UID
 maps), `scp` (standalone loopback receiver for rehearsal), `selftest`.
 
-The **GUI** wraps all of this: `py dcm_migrate_gui.py migration.toml`.
+The **GUI** wraps all of this: `py dcm_migrate_gui.py migration.toml` (or
+double-click `dcm_migrate_gui.cmd`). Its **config editor** is generated from
+`dcm_migrate schema` and supports adding/removing/reordering sources, archives,
+ID rules and routing groups while preserving your comments and formatting; a
+**New workspace** button builds a fresh config from scratch. `dcm_migrate
+schema` prints that schema as JSON if you want to drive your own tooling.
 
 ### Stopping a send
 
@@ -166,17 +171,20 @@ an `other` block as fallback.
 | `station` | regex | optional gate on StationName. |
 | `institution` | regex | optional gate on InstitutionName. |
 
-### `[source.fuji]` — built-in study-level ID generator
+### `[source.id_generator]` — built-in study-level ID generator
 
-For CR archives whose PatientIDs are unusable. New ID = `{site}{date}{###}`.
+For archives whose PatientIDs are unusable. Vendor-neutral; the legacy key
+`[source.fuji]` is still accepted as an alias (and the GUI editor migrates it to
+`id_generator` on open).
 
 | key | type | default | meaning |
 |---|---|---|---|
 | `enabled` | bool | `false` | turn the generator on for this source. |
+| `type` | `site_ordinal` | `site_ordinal` | generator algorithm. Only the built-in `site_ordinal` (`{site}{date}{###}`) exists today; the block is vendor-neutral so more can be added. |
 | `sites` | list | `["8K","9K"]` | site codes looked for as substrings of InstitutionName. |
 | `folder_site_map` | table | `{}` | `path-fragment = "SITE"` (case-insensitive on the file's absolute path) for files without a site flag in InstitutionName. |
 | `fallback_site` | str | `""` | site for studies matching neither InstitutionName nor folder map; `""` makes them `H-PID-RULE-MISS` blockers instead. |
-| `date_from_mtime` | bool | `true` | no/invalid StudyDate → derive the ID date from file mtime (`W-FUJI-MTIME-DATE`) instead of blocking (`H-FUJI-NO-DATE`). |
+| `date_from_mtime` | bool | `true` | no/invalid StudyDate → derive the ID date from file mtime (`W-IDGEN-MTIME-DATE`) instead of blocking (`H-IDGEN-NO-DATE`). |
 | `original_id` | `drop`\|`suffix` | `drop` | `drop` = replace the ID entirely; `suffix` = append the sanitized/transliterated original (`8K319001-<original>`). |
 | `id_date_format` | `myy`\|`mmyy`\|`yymm` | `myy` | date part: `myy` is historical and ambiguous past 999 studies/month; `mmyy`/`yymm` are fixed-width and collision-free (`yymm` also sorts chronologically). |
 

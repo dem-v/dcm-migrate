@@ -153,12 +153,17 @@ the console pane, and pause/resume is the engine's own PAUSE-file mechanism.
   slot and stay mutually exclusive
 - live `progress:` ticker parsed from a running send, PAUSE/RESUME toggle,
   latest `summary.html` opener
-- **built-in config editor** with a form for every option, colour-coded by
-  consequence: green `[network]` fields save with only a send restart; amber
-  content fields disarm the gate and are locked behind an explicit opt-in.
-  Saves are validated by the engine before writing, back up the original, and
-  **preserve your comments and formatting** (surgical line edits; falls back to
-  regeneration only when it can't prove the result identical, and says so).
+- **built-in config editor**, schema-driven (the form is generated from the
+  engine's own `schema`, so it never drifts) with full **structural editing** —
+  add / remove / reorder sources, archives (destinations), ID rules, routing
+  groups and folder mappings — not just value tweaks. Colour-coded by
+  consequence: green `[network]` saves with only a send restart; amber content
+  fields disarm the gate and are locked behind an explicit opt-in. Saves are
+  validated by the engine before writing and back up the original, and
+  **comments and formatting are always preserved** (the document model is
+  `tomlkit`). A **New workspace** button seeds a fresh, valid config from
+  scratch. (The editor uses `tomlkit`, installed automatically via `uv` / the
+  `.cmd` launcher; without it, edit the raw TOML.)
 - **DB maintenance** buttons (ANALYZE / rebuild indexes / checkpoint) for when
   `verify`/`status` slow down on a large database
 - **first-run guidance**: a workflow stepper (Config → Scan → Analyze → Approve

@@ -97,7 +97,7 @@ from pynetdicom import AE, build_context, evt
 from pynetdicom.presentation import PresentationContext
 from pynetdicom.sop_class import Verification, StudyRootQueryRetrieveInformationModelFind
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PROG = "dcm_migrate"
 
 # Be lenient when reading legacy garbage; we do our own validation.
@@ -185,7 +185,7 @@ H_PID_RULE_MISS = "H-PID-RULE-MISS"
 H_PID_COLLISION = "H-PID-COLLISION"   # two studies assigned the same study-level ID
 H_PIXELLESS_ONLY = "H-PIXELLESS-ONLY"
 H_NO_IDENTITY = "H-NO-PATIENT-IDENTITY"
-H_FUJI_NO_DATE = "H-FUJI-NO-DATE"
+H_IDGEN_NO_DATE = "H-IDGEN-NO-DATE"
 W_CHARSET_GUESSED = "W-CHARSET-GUESSED"
 W_CHARSET_LOSSY = "W-CHARSET-LOSSY"
 W_PN_CARET = "W-PN-CARET-REPAIRED"
@@ -198,7 +198,7 @@ W_DUP_REGEN = "W-DUP-COLLISION-REGEN"      # same-UID/diff-pixels kept via new U
 W_DUP_DROPPED = "W-DUP-COLLISION-DROPPED"  # same-UID/diff-pixels, losers discarded
 W_PID_REWRITE = "W-PID-REWRITE"
 W_IDENTITY_PLACEHOLDER = "W-IDENTITY-PLACEHOLDER"
-W_FUJI_MTIME_DATE = "W-FUJI-MTIME-DATE"   # ID date derived from file mtime
+W_IDGEN_MTIME_DATE = "W-IDGEN-MTIME-DATE"   # ID date derived from file mtime
 W_COMPANION_ROUTED = "W-COMPANION-ROUTED"  # SR/PR/OT/… study rerouted to sibling's archive
 W_KEEPGB = "W-GB-DECLARATION-FIXED"
 I_NONDICOM = "I-NON-DICOM"
@@ -304,8 +304,13 @@ class PidRule:
 
 
 @dataclass
-class FujiCfg:
+class IdGenCfg:
+    # Study-level PatientID generator.  Configured as [source.id_generator]
+    # (legacy alias: [source.fuji]).  `type` selects the algorithm; only the
+    # built-in "site_ordinal" ({site}{date}{###}) exists today, but the block is
+    # vendor-neutral so more generators can be added without a schema change.
     enabled: bool = False
+    type: str = "site_ordinal"
     sites: list[str] = field(default_factory=lambda: ["8K", "9K"])
     # folder path fragment (matched case-insensitively against the file's absolute path) -> site code
     folder_site_map: dict[str, str] = field(default_factory=dict)
@@ -313,7 +318,7 @@ class FujiCfg:
     # (mixed/legacy sources).  "" => such studies become H-PID-RULE-MISS blockers.
     fallback_site: str = ""
     # studies with no/invalid StudyDate: derive the ID date from file mtime
-    # (W-FUJI-MTIME-DATE) instead of blocking with H-FUJI-NO-DATE
+    # (W-IDGEN-MTIME-DATE) instead of blocking with H-IDGEN-NO-DATE
     date_from_mtime: bool = True
     # what happens to the original PatientID: "drop" (replace entirely) or
     # "suffix" (append it to the generated ID: 8K319001-<sanitized original>)
@@ -342,7 +347,7 @@ class SourceCfg:
     file_globs: list[str] = field(default_factory=list)   # empty = all files
     pid_rules_mode: str = "off"            # off | optional | required
     patient_id_rules: list[PidRule] = field(default_factory=list)
-    fuji: FujiCfg = field(default_factory=FujiCfg)
+    id_generator: IdGenCfg = field(default_factory=IdGenCfg)
     index_db: str = ""                     # orthanc adapter: optional path to Orthanc SQLite index
 
 
@@ -469,11 +474,15 @@ def load_config(path: str) -> Config:
     for i, sd in enumerate(data.get("source", [])):
         sd = dict(sd)
         rules = sd.pop("patient_id_rule", [])
-        fuji = sd.pop("fuji", {})
+        # [source.id_generator] is the current key; [source.fuji] is the legacy alias
+        idg = sd.pop("id_generator", None)
+        legacy = sd.pop("fuji", None)
+        if idg is None:
+            idg = legacy if legacy is not None else {}
         src = _dc_from_dict(SourceCfg, sd, f"[[source]] #{i}", errors)
         src.patient_id_rules = [_dc_from_dict(PidRule, r, f"source {src.name} rule #{j}", errors)
                                 for j, r in enumerate(rules)]
-        src.fuji = _dc_from_dict(FujiCfg, fuji, f"source {src.name} [source.fuji]", errors)
+        src.id_generator = _dc_from_dict(IdGenCfg, idg, f"source {src.name} [source.id_generator]", errors)
         cfg.sources.append(src)
 
     # ---- validation ----
@@ -509,17 +518,19 @@ def load_config(path: str) -> Config:
                     re.compile(r.institution)
             except re.error as e:
                 errors.append(f"{c} rule {r.id!r}: bad regex: {e}")
-        if s.fuji.enabled and s.pid_rules_mode == "off":
+        if s.id_generator.enabled and s.pid_rules_mode == "off":
             s.pid_rules_mode = "required"
     if cfg.general.diff_content_policy not in ("block", "regenerate-uid", "keep-priority"):
         errors.append("[general].diff_content_policy must be block|regenerate-uid|keep-priority")
     if cfg.general.no_identity_policy not in ("block", "placeholder"):
         errors.append("[general].no_identity_policy must be block|placeholder")
     for s in cfg.sources:
-        if s.fuji.original_id not in ("drop", "suffix"):
-            errors.append(f"source {s.name}: [source.fuji].original_id must be drop|suffix")
-        if s.fuji.id_date_format not in ("myy", "mmyy", "yymm"):
-            errors.append(f"source {s.name}: [source.fuji].id_date_format must be myy|mmyy|yymm")
+        if s.id_generator.type not in ("site_ordinal",):
+            errors.append(f"source {s.name}: [source.id_generator].type must be site_ordinal")
+        if s.id_generator.original_id not in ("drop", "suffix"):
+            errors.append(f"source {s.name}: [source.id_generator].original_id must be drop|suffix")
+        if s.id_generator.id_date_format not in ("myy", "mmyy", "yymm"):
+            errors.append(f"source {s.name}: [source.id_generator].id_date_format must be myy|mmyy|yymm")
     if not cfg.server.destinations:
         errors.append("no [server.destinations.*] defined (need at least 'other')")
     if "other" not in cfg.server.destinations and set(cfg.routing.precedence) - set(cfg.server.destinations):
@@ -680,8 +691,10 @@ charset_detect_order = ["utf-8", "cp1251", "latin-1"]
 caret_repair = true
 max_readers = 4
 pid_rules_mode = "required"      # every study MUST get a generated ID
-[source.fuji]
+# Study-level PatientID generator.  (Legacy alias: [source.fuji] still works.)
+[source.id_generator]
 enabled = true                   # study-level ID: {site}{M}{YY}{###}
+type = "site_ordinal"            # generator algorithm (built-in: site_ordinal)
 sites = ["8K", "9K"]             # looked for as substrings of InstitutionName
 fallback_site = "XK"             # mixed/legacy studies with no clear site -> XK marker
                                  # ("" would make them H-PID-RULE-MISS blockers instead).
@@ -689,7 +702,7 @@ fallback_site = "XK"             # mixed/legacy studies with no clear site -> XK
                                  # pooled fallback exceeds 999 studies/month and the
                                  # no-leading-zero form collides (Dec-21#1 == Jan-22#1001)
 date_from_mtime = true           # no/invalid StudyDate: use the file's mtime for the ID
-                                 # date (W-FUJI-MTIME-DATE) instead of H-FUJI-NO-DATE
+                                 # date (W-IDGEN-MTIME-DATE) instead of H-IDGEN-NO-DATE
 original_id = "drop"             # "drop": ID fully replaced; "suffix": generated ID +
                                  # "-" + sanitized/transliterated original PatientID
 id_date_format = "myy"           # date part of the ID: "myy" (historical, ambiguous
@@ -697,7 +710,7 @@ id_date_format = "myy"           # date part of the ID: "myy" (historical, ambig
                                  # (fixed-width, sorts chronologically)
 # Files without a site flag in InstitutionName get their site from the folder
 # they came from (case-insensitive substring match on the absolute path):
-[source.fuji.folder_site_map]
+[source.id_generator.folder_site_map]
 #'\8ksante' = "8K"
 #'\8kdisk2' = "8K"
 #'\8k'      = "8K"
@@ -1772,19 +1785,19 @@ def apply_pid_rules(src: SourceCfg, pid: str, station: str, institution: str
     return None, None
 
 
-def fuji_site_for(src: SourceCfg, institution: str, abs_path: str) -> str | None:
+def site_for(src: SourceCfg, institution: str, abs_path: str) -> str | None:
     inst = (institution or "").upper()
-    for site in src.fuji.sites:
+    for site in src.id_generator.sites:
         if site.upper() in inst:
             return site
     low = abs_path.lower().replace("/", "\\")
-    for frag, site in src.fuji.folder_site_map.items():
+    for frag, site in src.id_generator.folder_site_map.items():
         if frag.lower().replace("/", "\\") in low:
             return site
     return None
 
 
-def fuji_pid(site: str, study_date: str, ordinal: int, fmt: str = "myy") -> str:
+def site_ordinal_pid(site: str, study_date: str, ordinal: int, fmt: str = "myy") -> str:
     """{site}{date-part}{###} — ### is the per-site+month ordinal (grows past
     999 naturally).  fmt selects the date part:
       "myy"  — M (1..12, no leading zero) + YY: the historical device format.
@@ -1799,7 +1812,7 @@ def fuji_pid(site: str, study_date: str, ordinal: int, fmt: str = "myy") -> str:
     return f"{site}{part}{ordinal:03d}"
 
 
-def fuji_pid_with_original(gen: str, old: str) -> str:
+def id_with_original(gen: str, old: str) -> str:
     """original_id="suffix": '<generated>-<sanitized original>', capped at the
     64-char LO limit.  The original is mojibake-decoded (display_text) and
     transliterated so Cyrillic device IDs become ASCII-safe."""
@@ -2102,10 +2115,10 @@ def src_to_dict(src: SourceCfg) -> dict:
 def src_from_dict(d: dict) -> SourceCfg:
     d = dict(d)
     rules = [PidRule(**r) for r in d.pop("patient_id_rules", [])]
-    fuji = FujiCfg(**d.pop("fuji", {}))
+    idg = IdGenCfg(**d.pop("id_generator", {}))
     src = SourceCfg(**d)
     src.patient_id_rules = rules
-    src.fuji = fuji
+    src.id_generator = idg
     return src
 
 
@@ -2790,7 +2803,7 @@ def _study_source_map(conn) -> dict[int, str]:
 def _an_pid_assign(conn, cfg: Config, run: int) -> None:
     study_src = _study_source_map(conn)
     for src in cfg.sources:
-        if src.pid_rules_mode == "off" and not src.fuji.enabled:
+        if src.pid_rules_mode == "off" and not src.id_generator.enabled:
             continue
         study_pks = [pk for pk, s in study_src.items() if s == src.name]
         if not study_pks:
@@ -2803,7 +2816,7 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
                 "FROM studies s LEFT JOIN patients p USING(patient_pk) WHERE s.study_pk=?",
                 (pk,)).fetchone()
         n_rewritten = 0
-        if src.fuji.enabled:
+        if src.id_generator.enabled:
             groups: dict[tuple[str, str], list] = {}
             mtime_dated: list[tuple[str, str]] = []
             for pk, row in rows.items():
@@ -2812,9 +2825,9 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
                     "WHERE i.study_pk=? AND i.canonical=1 "
                     "ORDER BY i.instance_id LIMIT 1", (pk,)).fetchone()
                 path = _abs_path(conn, inst["file_id"]) if inst else ""
-                site = fuji_site_for(src, row["institution"], path)
+                site = site_for(src, row["institution"], path)
                 if site is None:
-                    site = src.fuji.fallback_site or None
+                    site = src.id_generator.fallback_site or None
                 if site is None:
                     conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
                                  "VALUES(?,?,?,?,?,?)",
@@ -2826,13 +2839,13 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
                     continue
                 date = row["study_date"]
                 if not re.fullmatch(r"\d{8}", date or ""):
-                    if src.fuji.date_from_mtime and inst and inst["mtime_ns"]:
+                    if src.id_generator.date_from_mtime and inst and inst["mtime_ns"]:
                         date = time.strftime("%Y%m%d", time.localtime(inst["mtime_ns"] / 1e9))
                         mtime_dated.append((row["study_uid"], date))
                     else:
                         conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
                                      "VALUES(?,?,?,?,?,?)",
-                                     (run, SEV_HARD, H_FUJI_NO_DATE, "study", pk,
+                                     (run, SEV_HARD, H_IDGEN_NO_DATE, "study", pk,
                                       json.dumps({"source": src.name, "study_uid": row["study_uid"],
                                                   "study_date": row["study_date"]},
                                                  ensure_ascii=False)))
@@ -2844,20 +2857,20 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
                 # fallback-site pool spans many institutions -> months exceed 999
                 # studies; under the ambiguous "myy" format only a fixed-width
                 # form is collision-free there.  8K/9K keep the configured format.
-                fmt = src.fuji.id_date_format
-                if fmt == "myy" and src.fuji.fallback_site and site == src.fuji.fallback_site:
+                fmt = src.id_generator.id_date_format
+                if fmt == "myy" and src.id_generator.fallback_site and site == src.id_generator.fallback_site:
                     fmt = "mmyy"
                 for ordinal, (date, _t, _uid, pk) in enumerate(lst, start=1):
-                    new_id = fuji_pid(site, date, ordinal, fmt)
-                    if src.fuji.original_id == "suffix":
-                        new_id = fuji_pid_with_original(new_id, rows[pk]["pid"])
+                    new_id = site_ordinal_pid(site, date, ordinal, fmt)
+                    if src.id_generator.original_id == "suffix":
+                        new_id = id_with_original(new_id, rows[pk]["pid"])
                     conn.execute("UPDATE studies SET pid_new=?, pid_rule=? WHERE study_pk=?",
-                                 (new_id, f"fuji:{site}", pk))
+                                 (new_id, f"siteid:{site}", pk))
                     n_rewritten += 1
             # study-level IDs MUST be unique: any duplicate blocks the gate
             for pid_new, n_dup, uids in conn.execute(
                     "SELECT pid_new, COUNT(*), GROUP_CONCAT(study_uid) FROM studies "
-                    "WHERE source=? AND pid_new IS NOT NULL AND pid_rule LIKE 'fuji:%' "
+                    "WHERE source=? AND pid_new IS NOT NULL AND pid_rule LIKE 'siteid:%' "
                     "GROUP BY pid_new HAVING COUNT(*)>1", (src.name,)):
                 conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
                              "VALUES(?,?,?,?,?,?)",
@@ -2869,7 +2882,7 @@ def _an_pid_assign(conn, cfg: Config, run: int) -> None:
             if mtime_dated:
                 conn.execute("INSERT INTO problems(run_id,severity,code,scope,ref,detail) "
                              "VALUES(?,?,?,?,?,?)",
-                             (run, SEV_WARN, W_FUJI_MTIME_DATE, "aggregate", None,
+                             (run, SEV_WARN, W_IDGEN_MTIME_DATE, "aggregate", None,
                               json.dumps({"source": src.name, "studies": len(mtime_dated),
                                           "sample": mtime_dated[:20]}, ensure_ascii=False)))
         else:
@@ -3117,19 +3130,19 @@ def _norm_name_for_cluster(name: str) -> str:
 
 def _report_clusters(conn, cfg: Config, outdir: Path) -> None:
     """Informational: candidate same-patient groups for study-level-ID sources."""
-    fuji_sources = [s.name for s in cfg.sources if s.fuji.enabled]
-    if not fuji_sources:
+    idgen_sources = [s.name for s in cfg.sources if s.id_generator.enabled]
+    if not idgen_sources:
         return
     f, w = _csv_writer(outdir / "patient_clusters.csv",
                        ["cluster", "birth_date", "name", "old_patient_id",
                         "new_patient_id", "study_date", "study_uid"])
-    qmarks = ",".join("?" * len(fuji_sources))
+    qmarks = ",".join("?" * len(idgen_sources))
     clusters: dict[tuple[str, str], list] = {}
     for row in conn.execute(
             f"SELECT s.study_uid, s.study_date, s.pid_new, COALESCE(p.pid_raw,'') pid,"
             f" COALESCE(p.name_raw,'') name, COALESCE(p.birth_date,'') birth "
             f"FROM studies s LEFT JOIN patients p USING(patient_pk) "
-            f"WHERE s.source IN ({qmarks}) AND s.n_instances>0", fuji_sources):
+            f"WHERE s.source IN ({qmarks}) AND s.n_instances>0", idgen_sources):
         key = (row["birth"], _norm_name_for_cluster(display_text(row["name"])))
         if key[1]:
             clusters.setdefault(key, []).append(row)
@@ -4336,6 +4349,121 @@ def cmd_checkconfig(cfg: Config, args) -> int:
     return 0
 
 
+# Config schema — the single source of truth the GUI editor renders from.
+# Field names/types/defaults come from the dataclasses (so they never drift);
+# this table only adds the descriptive bits dataclasses can't carry.
+# kind: str|path|int|float|bool|csv|lines|"enum:a,b,c"
+_SCHEMA_META = {
+    ("general", "db_path"): ("path", "SQLite state DB (WAL). Keep on SSD."),
+    ("general", "report_dir"): ("path", "Where analyze/verify reports and CSVs are written."),
+    ("general", "sidecar_dir"): ("path", "JSONL audit of every modified attribute."),
+    ("general", "log_file"): ("path", "Log destination."),
+    ("general", "pause_file"): ("path", "Create this file to make senders drain and idle."),
+    ("general", "scan_backend"): ("enum:auto,threads,processes", "Reader-pool model."),
+    ("general", "sidecar_compress"): ("bool", "zstd-compress sidecars when available (3.14+)."),
+    ("general", "uid_root"): ("str", "Root for regenerated UIDs; 2.25 = UUID-derived."),
+    ("general", "diff_content_policy"): ("enum:block,regenerate-uid,keep-priority",
+                                         "Same SOPInstanceUID, different pixels."),
+    ("general", "no_identity_policy"): ("enum:block,placeholder",
+                                        "Studies with no PatientID and no PatientName."),
+    ("server", "host"): ("str", "PACS IP / hostname (shared across archives)."),
+    ("server", "max_pdu"): ("int", "Max PDU size (bytes)."),
+    ("server", "acse_timeout"): ("int", "Association negotiation timeout (s)."),
+    ("server", "dimse_timeout"): ("int", "Per-operation DIMSE timeout (s)."),
+    ("server", "network_timeout"): ("int", "Socket timeout (s)."),
+    ("destination", "port"): ("int", "Archive port."),
+    ("destination", "called_aet"): ("str", "Archive AE title for this group."),
+    ("network", "rate_limit_mbit"): ("float", "Bandwidth cap; 0 = unlimited."),
+    ("network", "active_hours"): ("str", 'Send window HH:MM-HH:MM; "" = always.'),
+    ("network", "active_days"): ("csv", "Days the window applies."),
+    ("network", "max_instance_retries"): ("int", "Retry budget per instance; 1 = no retry."),
+    ("network", "circuit_breaker_failures"): ("int", "Consecutive fails to trip; 0 clamps to 1."),
+    ("routing", "precedence"): ("csv", "Highest-precedence group wins for mixed-modality studies."),
+    ("routing", "companion"): ("csv", "Opt-in: companion-only studies adopt a sibling's archive."),
+    ("source", "roots"): ("lines", "Directories to scan (one per line)."),
+    ("source", "adapter"): ("enum:filetree,orthanc", "Source layout."),
+    ("source", "priority"): ("int", "Lower wins when the same SOPInstanceUID is in several sources."),
+    ("source", "charset_policy"): ("enum:utf8,keep-gb,keep", "Text-encoding handling."),
+    ("source", "charset_source"): ("str", "auto, or a codec name (cp1251, gb18030, …)."),
+    ("source", "charset_detect_order"): ("csv", "Codecs tried in order when detecting/repairing."),
+    ("source", "is_fix_tags"): ("csv", "IS-VR tags whose decimals get rounded to integers."),
+    ("source", "exclude_dirs"): ("csv", "Directory names pruned during scan."),
+    ("source", "exclude_file_globs"): ("csv", "Filename globs skipped."),
+    ("source", "file_globs"): ("csv", "If set, only these globs are scanned (empty = all)."),
+    ("source", "pid_rules_mode"): ("enum:off,optional,required", "ID-rule enforcement."),
+    ("source", "index_db"): ("path", "orthanc adapter: optional read-only Orthanc index path."),
+    ("id_generator", "type"): ("enum:site_ordinal", "Generator algorithm (built-in: site_ordinal)."),
+    ("id_generator", "sites"): ("csv", "Site codes looked for in InstitutionName."),
+    ("id_generator", "fallback_site"): ("str", 'Site for unmatched studies; "" makes them blockers.'),
+    ("id_generator", "original_id"): ("enum:drop,suffix", "Replace the ID, or append the original."),
+    ("id_generator", "id_date_format"): ("enum:myy,mmyy,yymm", "Date part of the generated ID."),
+    ("rule", "match"): ("str", "Regex on PatientID; named groups usable in template."),
+    ("rule", "template"): ("str", "New ID, e.g. SITEB-{num:0>8}."),
+    ("rule", "station"): ("str", "Optional regex gate on StationName."),
+    ("rule", "institution"): ("str", "Optional regex gate on InstitutionName."),
+}
+
+
+def _schema_field(section: str, f) -> dict:
+    default = (f.default if f.default is not dataclasses.MISSING
+               else f.default_factory() if f.default_factory is not dataclasses.MISSING else None)
+    kind, help_ = _SCHEMA_META.get((section, f.name), ("", ""))
+    choices = None
+    if kind.startswith("enum:"):
+        choices, kind = kind.split(":", 1)[1].split(","), "enum"
+    if not kind:
+        if isinstance(default, bool):
+            kind = "bool"
+        elif isinstance(default, int):
+            kind = "int"
+        elif isinstance(default, float):
+            kind = "float"
+        elif isinstance(default, list):
+            kind = "csv"
+        else:
+            kind = "str"
+    return {"name": f.name, "kind": kind, "default": default, "choices": choices, "help": help_}
+
+
+def build_schema() -> dict:
+    def flds(cls, section, skip=()):
+        return [_schema_field(section, f) for f in dataclasses.fields(cls) if f.name not in skip]
+    return {
+        "version": VERSION,
+        "sections": [
+            {"key": "general", "label": "[general]", "cardinality": "table", "gate": True,
+             "fields": flds(GeneralCfg, "general")},
+            {"key": "server", "label": "[server]", "cardinality": "table", "gate": True,
+             "fields": flds(ServerCfg, "server", skip=("destinations",)),
+             "children": [
+                 {"key": "destinations", "label": "destinations (archives)", "cardinality": "table_map",
+                  "gate": True, "key_hint": "group name (ct, xray, xa, other, …)",
+                  "value_fields": flds(Destination, "destination")}]},
+            {"key": "network", "label": "[network]  (safe — retune without disarming)",
+             "cardinality": "table", "gate": False, "fields": flds(NetworkCfg, "network")},
+            {"key": "routing", "label": "[routing]", "cardinality": "table", "gate": True,
+             "fields": flds(RoutingCfg, "routing", skip=("groups",)),
+             "groups": {"label": "modality groups (name → modalities)", "key_hint": "group name"}},
+            {"key": "source", "label": "[[source]]", "cardinality": "array_table", "gate": True,
+             "key_field": "name", "fields": flds(SourceCfg, "source", skip=("patient_id_rules", "id_generator")),
+             "children": [
+                 {"key": "id_generator", "label": "[source.id_generator] — study-level ID generator (alias: fuji)",
+                  "cardinality": "opt_table", "gate": True, "fields": flds(IdGenCfg, "id_generator", skip=("folder_site_map",)),
+                  "children": [
+                      {"key": "folder_site_map", "label": "folder → site map", "cardinality": "scalar_map",
+                       "gate": True, "value_kind": "str", "key_hint": "path fragment"}]},
+                 {"key": "patient_id_rule", "label": "[[source.patient_id_rule]] (first match wins)",
+                  "cardinality": "array_table", "gate": True, "key_field": "id",
+                  "fields": flds(PidRule, "rule")}]},
+        ],
+    }
+
+
+def cmd_schema(args) -> int:
+    print(json.dumps(build_schema(), indent=2, default=str))
+    return 0
+
+
 def cmd_maintain(cfg: Config, args) -> int:
     """Database housekeeping for a large, long-lived state DB.  Safe to run
     while scan/send are active (WAL); ANALYZE is the single biggest win once
@@ -5246,11 +5374,11 @@ calling_aet = "MIG_FUJI"
 priority = 50
 pid_rules_mode = "required"
 max_readers = 2
-[source.fuji]
+[source.id_generator]
 enabled = true
 sites = ["8K", "9K"]
 fallback_site = "XK"
-[source.fuji.folder_site_map]
+[source.id_generator.folder_site_map]
 'site_b' = "9K"
 """
 
@@ -5281,18 +5409,18 @@ def _selftest_units(check) -> None:
     check(codec == "cp1251", f"detect cp1251 (got {codec})")
     codec, _ = detect_codec("Петренко".encode("utf-8"), ["utf-8", "cp1251", "latin-1"])
     check(codec == "utf-8", f"detect utf-8 (got {codec})")
-    check(fuji_pid("8K", "20190301", 1) == "8K319001", "fuji pid format")
-    check(fuji_pid("9K", "20191115", 23) == "9K1119023", "fuji pid Nov")
-    check(fuji_pid("XK", "20190301", 1, "mmyy") == "XK0319001", "fuji pid mmyy")
-    check(fuji_pid("XK", "20190301", 1, "yymm") == "XK1903001", "fuji pid yymm")
-    check(fuji_pid("XK", "20211201", 1, "yymm")
-          != fuji_pid("XK", "20220112", 1001, "yymm"),
+    check(site_ordinal_pid("8K", "20190301", 1) == "8K319001", "fuji pid format")
+    check(site_ordinal_pid("9K", "20191115", 23) == "9K1119023", "fuji pid Nov")
+    check(site_ordinal_pid("XK", "20190301", 1, "mmyy") == "XK0319001", "fuji pid mmyy")
+    check(site_ordinal_pid("XK", "20190301", 1, "yymm") == "XK1903001", "fuji pid yymm")
+    check(site_ordinal_pid("XK", "20211201", 1, "yymm")
+          != site_ordinal_pid("XK", "20220112", 1001, "yymm"),
           "fuji pid ambiguity resolved (Dec-21#1 vs Jan-22#1001)")
-    check(fuji_pid_with_original("8K319001", " 1Ð¢Ð\x92-15037 ") == "8K319001-1TV-15037",
+    check(id_with_original("8K319001", " 1Ð¢Ð\x92-15037 ") == "8K319001-1TV-15037",
           f"fuji suffix mojibake-decoded+translit (got "
-          f"{fuji_pid_with_original('8K319001', ' 1Ð¢Ð' + chr(0x92) + '-15037 ')!r})")
-    check(fuji_pid_with_original("8K319001", "") == "8K319001", "fuji suffix empty old")
-    check(len(fuji_pid_with_original("XK1903001", "X" * 100)) == 64, "fuji suffix 64-cap")
+          f"{id_with_original('8K319001', ' 1Ð¢Ð' + chr(0x92) + '-15037 ')!r})")
+    check(id_with_original("8K319001", "") == "8K319001", "fuji suffix empty old")
+    check(len(id_with_original("XK1903001", "X" * 100)) == 64, "fuji suffix 64-cap")
     src = SourceCfg(name="t", roots=["x"], patient_id_rules=[
         PidRule(id="r", match=r"^VX-(?P<n>\d+)$", template="VX{n}")])
     check(apply_pid_rules(src, "VX-007", "", "") == ("VX007", "r"), "pid rule")
@@ -5323,6 +5451,29 @@ def cmd_selftest(_cfg, args) -> int:
             log.error("FAIL %s", msg)
 
     _selftest_units(check)
+
+    # schema drift guard: every _SCHEMA_META entry must name a real dataclass field
+    dc_by_sec = {"general": GeneralCfg, "server": ServerCfg, "destination": Destination,
+                 "network": NetworkCfg, "routing": RoutingCfg, "source": SourceCfg,
+                 "id_generator": IdGenCfg, "rule": PidRule}
+    for (sec, fname) in _SCHEMA_META:
+        fields = {f.name for f in dataclasses.fields(dc_by_sec[sec])} if sec in dc_by_sec else set()
+        check(fname in fields, f"schema meta ({sec}.{fname}) matches a dataclass field")
+    check(bool(build_schema()["sections"]), "build_schema returns sections")
+
+    # legacy alias: [source.fuji] must still parse into id_generator
+    _alias_dir = Path(tempfile.mkdtemp(prefix="dcm_alias_"))
+    (_alias_dir / "m.toml").write_text(
+        '[server]\nhost="h"\n[server.destinations.other]\nport=1\ncalled_aet="X"\n'
+        '[routing]\nprecedence=["ct","xray","xa","other"]\n'
+        '[[source]]\nname="s"\nroots=["r"]\npid_rules_mode="required"\n'
+        '[source.fuji]\nenabled=true\nsites=["8K"]\nfallback_site="XK"\n', encoding="utf-8")
+    try:
+        _acfg = load_config(str(_alias_dir / "m.toml"))
+        check(_acfg.source("s").id_generator.enabled and _acfg.source("s").id_generator.type == "site_ordinal",
+              "[source.fuji] legacy alias parses into id_generator")
+    except SystemExit as e:
+        check(False, f"[source.fuji] alias failed to load: {e}")
 
     base = Path(tempfile.mkdtemp(prefix="dcm_migrate_selftest_"))
     log.info("selftest workspace: %s", base)
@@ -5601,6 +5752,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("doctor", help="preflight checklist: config, roots, DB, disk, connectivity")
     sp.add_argument("--no-echo", action="store_true", help="skip the C-ECHO connectivity test")
     sub.add_parser("checkconfig", help="validate the config file and print a summary")
+    sub.add_parser("schema", help="print the config schema as JSON (drives the GUI editor)")
     sp = sub.add_parser("maintain", help="DB housekeeping: checkpoint, indexes, ANALYZE "
                                          "(all but VACUUM by default)")
     sp.add_argument("--checkpoint", action="store_true", help="only: truncate the WAL")
@@ -5665,6 +5817,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": lambda: cmd_status(cfg, args),
         "doctor": lambda: cmd_doctor(cfg, args),
         "checkconfig": lambda: cmd_checkconfig(cfg, args),
+        "schema": lambda: cmd_schema(args),
         "maintain": lambda: cmd_maintain(cfg, args),
         "export-mapping": lambda: cmd_export_mapping(cfg, args),
         "probe": lambda: cmd_probe(cfg, args),
